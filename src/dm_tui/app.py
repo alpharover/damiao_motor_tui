@@ -745,13 +745,11 @@ class DmTuiApp(App[None]):
     CSS = """
     #content {
         height: 1fr;
-        gap: 1;
     }
 
     #left-column,
     #right-column {
         height: 1fr;
-        gap: 1;
     }
 
     #left-column {
@@ -1523,7 +1521,10 @@ class DmTuiApp(App[None]):
             del self._groups[name]
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.sender.id != "motor-table":
+        table = getattr(event, "data_table", None)
+        if table is None:
+            table = getattr(event, "control", None)
+        if table is not None and table.id != "motor-table":
             return
         try:
             esc_id = int(event.row_key)
