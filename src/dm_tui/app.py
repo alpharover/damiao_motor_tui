@@ -11,7 +11,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Deque, Dict, Iterable, Optional
 
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.events import Mount
@@ -21,6 +21,7 @@ from textual.timer import Timer
 from textual.command import Command, DiscoveryHit
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Log, Sparkline, Static
 
+from . import logging as telemetry_logging
 from .bus_manager import BusManager, BusManagerError, PeriodicTask
 from .controllers import (
     MotorTarget,
@@ -40,6 +41,7 @@ from .persistence import (
     AppConfig,
     GroupRecord,
     MotorRecord,
+    DEFAULT_CONFIG_DIR,
     ensure_bus,
     load_config,
     save_config,
@@ -802,6 +804,12 @@ class DmTuiApp(App[None]):
             group.name: GroupRecord(name=group.name, esc_ids=list(group.esc_ids))
             for group in self._config.groups
         }
+        config_dir = (
+            config_path.expanduser().parent if config_path else DEFAULT_CONFIG_DIR
+        )
+        self._telemetry_log_path = config_dir / "telemetry.csv"
+        self._telemetry_log_writer: telemetry_logging.TelemetryCsvWriter | None = None
+        self._telemetry_log_failed = False
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
@@ -845,6 +853,7 @@ class DmTuiApp(App[None]):
             self._discovery_timer.stop()
         self._stop_demo(disable=False)
         self._close_bus()
+        self._close_telemetry_log()
         self._mounted = False
 
     def watch_active_bus(self, active_bus: str) -> None:
@@ -1369,6 +1378,7 @@ class DmTuiApp(App[None]):
             v_max=limits[1],
             t_max=limits[2],
         )
+        self._append_telemetry_log(engineering, mst_id=mst_id, timestamp=timestamp)
         telemetry_record = TelemetryRecord(
             feedback=feedback,
             timestamp=timestamp,
@@ -1397,10 +1407,11 @@ class DmTuiApp(App[None]):
             config_changed = True
         if self.selected_esc is None:
             self.selected_esc = esc_id
-        self._refresh_motor_table()
-        self._refresh_telemetry_panel()
-        self._refresh_detail_panel()
-        self._refresh_velocity_sparkline()
+        if self._mounted:
+            self._refresh_motor_table()
+            self._refresh_telemetry_panel()
+            self._refresh_detail_panel()
+            self._refresh_velocity_sparkline()
         self._reapply_filters()
         if config_changed:
             self._persist_config()
@@ -1487,6 +1498,51 @@ class DmTuiApp(App[None]):
             self._bus_manager.close()
             self._bus_manager = None
 
+    def _ensure_telemetry_log(
+        self,
+    ) -> telemetry_logging.TelemetryCsvWriter | None:
+        if self._telemetry_log_failed:
+            return None
+        if self._telemetry_log_writer is None:
+            try:
+                self._telemetry_log_writer = telemetry_logging.open_csv(
+                    self._telemetry_log_path
+                )
+            except OSError as exc:
+                self._telemetry_log_failed = True
+                self._log(
+                    f"[yellow]Telemetry logging disabled:[/yellow] {exc}"
+                )
+                return None
+        return self._telemetry_log_writer
+
+    def _append_telemetry_log(
+        self,
+        engineering: protocol.FeedbackEngineering,
+        *,
+        mst_id: int,
+        timestamp: float,
+    ) -> None:
+        writer = self._ensure_telemetry_log()
+        if writer is None:
+            return
+        row = telemetry_logging.telemetry_row_from_engineering(
+            engineering, mst_id=mst_id, timestamp=timestamp
+        )
+        try:
+            writer.write_row(row)
+        except Exception as exc:  # pragma: no cover - unexpected filesystem errors
+            self._log(f"[yellow]Failed to append telemetry log:[/yellow] {exc}")
+            self._telemetry_log_failed = True
+            self._close_telemetry_log()
+
+    def _close_telemetry_log(self) -> None:
+        if self._telemetry_log_writer is not None:
+            try:
+                self._telemetry_log_writer.close()
+            finally:
+                self._telemetry_log_writer = None
+
     def _persist_config(self) -> None:
         self._config.motors = list(self._motor_records.values())
         self._config.active_bus = self.active_bus
@@ -1502,7 +1558,7 @@ class DmTuiApp(App[None]):
         text = f"[{timestamp}] {message}"
         try:
             log = self.query_one(ActivityLog)
-        except LookupError:
+        except (LookupError, ScreenStackError):
             pass
         else:
             log.write_line(text)
