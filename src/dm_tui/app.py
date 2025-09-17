@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -54,6 +55,23 @@ if TYPE_CHECKING:
 DEFAULT_P_MAX = 12.0
 DEFAULT_V_MAX = 30.0
 DEFAULT_T_MAX = 20.0
+
+
+def _parse_env_float(name: str, default: float) -> float:
+    """Return a float from *name* env var, falling back to *default* on errors."""
+
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+WATCHDOG_THRESHOLD_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_THRESHOLD", 3.0)
+WATCHDOG_COOLDOWN_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_COOLDOWN", 5.0)
+WATCHDOG_INTERVAL_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_INTERVAL", 1.0)
 
 
 def _parse_optional_float(value: str) -> float | None:
@@ -199,20 +217,43 @@ class MotorTable(DataTable):
         motors: Dict[int, MotorInfo],
         records: Dict[int, MotorRecord],
         now: float,
+        *,
+        telemetry: Dict[int, "TelemetryRecord"] | None = None,
+        watchdog_tripped: set[int] | None = None,
+        last_disable: Dict[int, float] | None = None,
     ) -> None:
         self.clear()
         self._row_keys.clear()
-        esc_ids = sorted(set(records.keys()) | set(motors.keys()))
+        esc_ids = sorted(set(records.keys()) | set(motors.keys()) | set(telemetry.keys() if telemetry else []))
         for esc_id in esc_ids:
             record = records.get(esc_id)
             info = motors.get(esc_id)
+            telemetry_record = telemetry.get(esc_id) if telemetry else None
             mst_id = info.mst_id if info else (record.mst_id if record else 0)
-            last_seen = "--"
-            status = "Configured"
+            last_seen_value: float | None = None
             if info:
-                delta = max(0.0, now - info.last_seen)
+                last_seen_value = info.last_seen
+            if telemetry_record is not None:
+                last_seen_value = (
+                    telemetry_record.timestamp
+                    if last_seen_value is None
+                    else max(last_seen_value, telemetry_record.timestamp)
+                )
+            status = "Configured"
+            delta = None
+            if last_seen_value is not None:
+                delta = max(0.0, now - last_seen_value)
                 last_seen = f"{delta:0.1f}s ago"
                 status = "Active" if delta < 2.0 else "Quiet"
+            else:
+                last_seen = "--"
+            triggered = bool(watchdog_tripped and esc_id in watchdog_tripped)
+            if triggered:
+                status = "[red]Watchdog[/red]"
+                if last_disable and esc_id in last_disable:
+                    since_disable = max(0.0, now - last_disable[esc_id])
+                    status = f"[red]Watchdog[/red] ({since_disable:0.1f}s ago)"
+                last_seen = f"[red]{last_seen}[/red]"
             name = record.name if record and record.name else "--"
             row_key = str(esc_id)
             self.add_row(
@@ -311,6 +352,8 @@ class MotorDetailPanel(Static):
         info: MotorInfo | None,
         telemetry: TelemetryRecord | None,
         now: float,
+        watchdog_active: bool = False,
+        watchdog_last: float | None = None,
     ) -> None:
         if telemetry:
             delta = now - telemetry.timestamp
@@ -340,6 +383,13 @@ class MotorDetailPanel(Static):
         if delta is not None:
             status = "Fresh" if delta < 1.0 else "Stale"
             lines.append(f"[b]Telemetry[/b] {status} ({delta:0.1f}s old)")
+        if watchdog_active:
+            if watchdog_last is not None:
+                lines.append(
+                    f"[red]Watchdog auto-disable[/red] {max(0.0, now - watchdog_last):0.1f}s ago."
+                )
+            else:
+                lines.append("[red]Watchdog auto-disable active.[/red]")
         self.update("\n".join(lines))
 
 
@@ -814,9 +864,15 @@ class DmTuiApp(App[None]):
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
+        self._watchdog_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
         self._discovery_running = False
         self._bus_stats_running = False
+        self._watchdog_threshold = WATCHDOG_THRESHOLD_SECONDS
+        self._watchdog_cooldown = max(WATCHDOG_COOLDOWN_SECONDS, self._watchdog_threshold)
+        self._watchdog_interval = max(WATCHDOG_INTERVAL_SECONDS, 0.2)
+        self._watchdog_last_disable: Dict[int, float] = {}
+        self._watchdog_tripped: set[int] = set()
         self.active_bus = self._config.active_bus
 
     def compose(self) -> ComposeResult:
@@ -843,12 +899,15 @@ class DmTuiApp(App[None]):
         self._open_bus(self.active_bus)
         self._bus_stats_timer = self.set_interval(3.0, self._schedule_bus_stats_refresh)
         self._discovery_timer = self.set_interval(4.0, self._schedule_discovery)
+        self._watchdog_timer = self.set_interval(self._watchdog_interval, self._watchdog_check)
 
     def on_unmount(self) -> None:
         if self._bus_stats_timer:
             self._bus_stats_timer.stop()
         if self._discovery_timer:
             self._discovery_timer.stop()
+        if self._watchdog_timer:
+            self._watchdog_timer.stop()
         self._stop_demo(disable=False)
         self._close_bus()
         self._close_telemetry_log()
@@ -1239,8 +1298,64 @@ class DmTuiApp(App[None]):
         with self._threads_lock:
             if self._bus_stats_running:
                 return
-            self._bus_stats_running = True
+        self._bus_stats_running = True
         threading.Thread(target=self._bus_stats_worker, daemon=True).start()
+
+    def _watchdog_check(self) -> None:
+        bus = self._bus_manager
+        if bus is None:
+            return
+        now = monotonic()
+        threshold = self._watchdog_threshold
+        cooldown = self._watchdog_cooldown
+        changed = False
+        stale: list[tuple[int, float]] = []
+        esc_ids = set(self._motors.keys()) | set(self._telemetry.keys())
+        for esc_id in esc_ids:
+            info = self._motors.get(esc_id)
+            telemetry = self._telemetry.get(esc_id)
+            last_seen: float | None = None
+            if info is not None:
+                last_seen = info.last_seen
+            if telemetry is not None:
+                last_seen = (
+                    telemetry.timestamp
+                    if last_seen is None
+                    else max(last_seen, telemetry.timestamp)
+                )
+            if last_seen is None:
+                continue
+            age = now - last_seen
+            if age < threshold:
+                if esc_id in self._watchdog_tripped:
+                    self._watchdog_tripped.discard(esc_id)
+                    changed = True
+                continue
+            if esc_id not in self._watchdog_tripped:
+                self._watchdog_tripped.add(esc_id)
+                changed = True
+            last_disable = self._watchdog_last_disable.get(esc_id)
+            if last_disable is not None and (now - last_disable) < cooldown:
+                continue
+            stale.append((esc_id, age))
+        if not stale:
+            if changed and self._mounted:
+                self._refresh_motor_table()
+                self._refresh_detail_panel()
+            return
+        for esc_id, age in stale:
+            try:
+                disable(bus, esc_id)
+            except BusManagerError as exc:  # pragma: no cover - hardware dependent
+                self._log(f"[red]Watchdog disable failed for ESC 0x{esc_id:02X}:[/red] {exc}")
+            else:
+                self._log(
+                    f"[red]Watchdog:[/red] ESC 0x{esc_id:02X} stale ({age:0.1f}s); issued disable."
+                )
+            self._watchdog_last_disable[esc_id] = now
+        if self._mounted:
+            self._refresh_motor_table()
+            self._refresh_detail_panel()
 
     def _discovery_worker(self, force_active: bool) -> None:
         try:
@@ -1309,6 +1424,9 @@ class DmTuiApp(App[None]):
             torque_nm=engineering.torque_nm,
         )
         self._telemetry[esc_id] = telemetry_record
+        if esc_id in self._watchdog_tripped:
+            self._watchdog_tripped.discard(esc_id)
+        self._watchdog_last_disable.pop(esc_id, None)
         writer = self._ensure_telemetry_log()
         if writer is not None:
             try:
@@ -1362,7 +1480,14 @@ class DmTuiApp(App[None]):
 
     def _refresh_motor_table(self) -> None:
         table = self.query_one(MotorTable)
-        table.update_rows(self._motors, self._motor_records, monotonic())
+        table.update_rows(
+            self._motors,
+            self._motor_records,
+            monotonic(),
+            telemetry=self._telemetry,
+            watchdog_tripped=self._watchdog_tripped,
+            last_disable=self._watchdog_last_disable,
+        )
         available = table.available_esc_ids()
         if not available:
             self.selected_esc = None
@@ -1384,6 +1509,8 @@ class DmTuiApp(App[None]):
             info=self._motors.get(esc_id),
             telemetry=self._telemetry.get(esc_id),
             now=monotonic(),
+            watchdog_active=esc_id in self._watchdog_tripped,
+            watchdog_last=self._watchdog_last_disable.get(esc_id),
         )
         self._refresh_velocity_sparkline()
 
@@ -1420,6 +1547,8 @@ class DmTuiApp(App[None]):
         self._telemetry_history.clear()
         self._torque_history.clear()
         self._temp_history.clear()
+        self._watchdog_tripped.clear()
+        self._watchdog_last_disable.clear()
         manager.register_listener(self._handle_bus_message)
         self._reapply_filters()
         self._log(f"Connected to {channel}.")

@@ -22,7 +22,7 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 - [ ] Implement frame pack/unpack utilities for enable/disable/zero, speed, position-speed, and MIT.
 - [ ] Decode feedback frames into engineering units leveraging RID-configured limits.
 - [ ] Implement RID read/write/save helpers for ID assignment and mode control.
-- [ ] Integrate global E-STOP and watchdog (highlight stale feedback, auto-disable if needed).
+- [x] Integrate global E-STOP and watchdog (highlight stale feedback, auto-disable if needed).
 
 ### Milestone 3 – Discovery & Configuration UX (Week 3)
 - [x] Passive sniff logic recognizing motors by feedback signature.
