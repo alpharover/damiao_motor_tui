@@ -21,7 +21,7 @@ from textual.timer import Timer
 from textual.command import Command, DiscoveryHit
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sparkline, Static, TextLog
 
-from .bus_manager import BusManager, BusManagerError
+from .bus_manager import BusManager, BusManagerError, PeriodicTask
 from .controllers import (
     MotorTarget,
     assign_motor_ids,
@@ -797,6 +797,10 @@ class DmTuiApp(App[None]):
         self._motors: Dict[int, MotorInfo] = {}
         self._telemetry: Dict[int, TelemetryRecord] = {}
         self._telemetry_history: Dict[int, Deque[float]] = {}
+        self._torque_history: Dict[int, Deque[float]] = {}
+        self._temp_history: Dict[int, Deque[int]] = {}
+        self._torque_history: Dict[int, Deque[float]] = {}
+        self._temp_history: Dict[int, Deque[int]] = {}
         self._groups: Dict[str, GroupRecord] = {
             group.name: GroupRecord(name=group.name, esc_ids=list(group.esc_ids))
             for group in self._config.groups
@@ -806,6 +810,8 @@ class DmTuiApp(App[None]):
         self._discovery_timer: Timer | None = None
         self._demo_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
+        self._demo_tasks: list[PeriodicTask] = []
+        self._demo_tasks: list[PeriodicTask] = []
         self._discovery_running = False
         self._bus_stats_running = False
         self._threads_lock = threading.Lock()
@@ -1097,6 +1103,12 @@ class DmTuiApp(App[None]):
         history = self._telemetry_history.pop(current_esc, None)
         if history:
             self._telemetry_history[result.esc_id] = history
+        torque_history = self._torque_history.pop(current_esc, None)
+        if torque_history:
+            self._torque_history[result.esc_id] = torque_history
+        temp_history = self._temp_history.pop(current_esc, None)
+        if temp_history:
+            self._temp_history[result.esc_id] = temp_history
         for group in self._groups.values():
             group.esc_ids = [result.esc_id if esc == current_esc else esc for esc in group.esc_ids]
         self._cleanup_empty_groups()
@@ -1173,32 +1185,53 @@ class DmTuiApp(App[None]):
             return
         self._stop_demo(disable=False)
         self._active_demo = ActiveDemo(definition=definition, esc_ids=esc_ids, start_time=monotonic())
+        self._demo_tasks = []
+        period_hz = max(20.0, definition.frequency_hz * 16.0)
+        for esc in esc_ids:
+            arb_id, payload = protocol.frame_speed(esc, 0.0)
+            try:
+                task = self._bus_manager.send_periodic(arb_id, payload, hz=period_hz)
+            except BusManagerError as exc:
+                self._log(f"[red]Failed to start demo for ESC 0x{esc:02X}:[/red] {exc}")
+                for handle in self._demo_tasks:
+                    try:
+                        handle.stop()
+                    except Exception:
+                        pass
+                self._demo_tasks.clear()
+                return
+            self._demo_tasks.append(task)
         self._demo_timer = self.set_interval(0.05, self._demo_tick)
         self._log(f"Starting demo '{definition.title}' using {label} ({len(esc_ids)} motors).")
 
     def _demo_tick(self) -> None:  # pragma: no cover - timing sensitive
-        if not self._bus_manager or not self._active_demo:
+        if not self._bus_manager or not self._active_demo or not self._demo_tasks:
             self._stop_demo(disable=False)
             return
         demo = self._active_demo
         t = monotonic() - demo.start_time
-        try:
-            targets = [
-                MotorTarget(
-                    esc_id=esc,
-                    velocity_rad_s=self._compute_demo_velocity(demo.definition, t, index, len(demo.esc_ids)),
-                )
-                for index, esc in enumerate(demo.esc_ids)
-            ]
-            command_velocities(self._bus_manager, targets)
-        except BusManagerError as exc:
-            self.call_from_thread(self._log, f"[red]Demo halted due to bus error:[/red] {exc}")
-            self.call_from_thread(self._stop_demo, True)
+        count = len(demo.esc_ids)
+        for index, esc_id in enumerate(demo.esc_ids):
+            velocity = self._compute_demo_velocity(demo.definition, t, index, count)
+            _, payload = protocol.frame_speed(esc_id, velocity)
+            try:
+                self._demo_tasks[index].update(data=payload)
+            except Exception as exc:
+                self.call_from_thread(self._log, f"[red]Demo halted:[/red] {exc}")
+                self.call_from_thread(self._stop_demo, True)
+                break
 
     def _stop_demo(self, disable: bool) -> None:
         if self._demo_timer is not None:
             self._demo_timer.stop()
             self._demo_timer = None
+        if self._demo_tasks:
+            for task in list(self._demo_tasks):
+                try:
+                    task.stop()
+                except Exception:
+                    pass
+            self._demo_tasks.clear()
         if not self._active_demo:
             return
         demo = self._active_demo
@@ -1315,15 +1348,20 @@ class DmTuiApp(App[None]):
             v_max=limits[1],
             t_max=limits[2],
         )
-        self._telemetry[esc_id] = TelemetryRecord(
+        telemetry_record = TelemetryRecord(
             feedback=feedback,
             timestamp=timestamp,
             position_rad=engineering.position_rad,
             velocity_rad_s=engineering.velocity_rad_s,
             torque_nm=engineering.torque_nm,
         )
-        history = self._telemetry_history.setdefault(esc_id, deque(maxlen=200))
-        history.append(engineering.velocity_rad_s)
+        self._telemetry[esc_id] = telemetry_record
+        velocity_history = self._telemetry_history.setdefault(esc_id, deque(maxlen=200))
+        velocity_history.append(engineering.velocity_rad_s)
+        torque_history = self._torque_history.setdefault(esc_id, deque(maxlen=200))
+        torque_history.append(engineering.torque_nm)
+        temp_history = self._temp_history.setdefault(esc_id, deque(maxlen=200))
+        temp_history.append(feedback.temp_mos)
         self._motors[esc_id] = MotorInfo(esc_id=esc_id, mst_id=mst_id, last_seen=timestamp)
         record = self._motor_records.get(esc_id)
         config_changed = False
@@ -1411,6 +1449,9 @@ class DmTuiApp(App[None]):
             return
         self._bus_manager = manager
         self._telemetry.clear()
+        self._telemetry_history.clear()
+        self._torque_history.clear()
+        self._temp_history.clear()
         manager.register_listener(self._handle_bus_message)
         self._reapply_filters()
         self._log(f"Connected to {channel}.")

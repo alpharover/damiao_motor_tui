@@ -49,6 +49,7 @@ Welcome to the **dm-tui** project. This guide orients any agent working on the R
 - `Ctrl+M`: edit group membership directly
 - `Ctrl+G`: run group actions (enable/disable/velocity)
 - `Ctrl+D`: launch demo choreography (`Ctrl+Shift+D` to stop)
+- Velocity sparkline in UI shows rolling rad/s history for selected motor.
 - `:`: open the command palette (demo/group/save shortcuts available)
 - `Ctrl+S`: persist configuration to disk
 

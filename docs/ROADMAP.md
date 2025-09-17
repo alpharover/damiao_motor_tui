@@ -33,6 +33,7 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 ### Milestone 4 – Monitoring & Control Screens (Week 4)
 - [x] Textual screen for bus health (bitrate, error counters, txqueuelen guidance).
 - [x] Live monitor panel with trendlines/metrics for position, velocity, torque, temps.
+- [x] Periodic-task demo engine (python-can BCM) with velocity sparkline history.
 - [ ] Control screen with per-motor enable/disable, zero, velocity and MIT controls.
 - [ ] Group command support and command palette bindings (`Space`, `e`, `d`, `r`, `g`).
 
