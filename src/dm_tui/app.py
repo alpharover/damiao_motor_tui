@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Deque, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Deque, Dict, Iterable, Optional
 
 from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
@@ -21,8 +21,7 @@ from textual.timer import Timer
 from textual.command import Command, DiscoveryHit
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Log, Sparkline, Static
 
-from . import logging as telemetry_logging
-from .bus_manager import BusManager, BusManagerError
+from .bus_manager import BusManager, BusManagerError, PeriodicTask
 from .controllers import (
     MotorTarget,
     assign_motor_ids,
@@ -37,7 +36,6 @@ from .controllers import (
 from .dmlib import protocol
 from .dmlib.protocol import Feedback
 from .discovery import MotorInfo, active_probe, passive_sniff
-from .demos import DemoHandle, brake_to_zero, sine_orchestra
 from .persistence import (
     AppConfig,
     GroupRecord,
@@ -48,6 +46,9 @@ from .persistence import (
     save_config,
 )
 from .osutils import read_bus_statistics
+
+if TYPE_CHECKING:
+    from .logging import TelemetryCsvWriter
 
 DEFAULT_P_MAX = 12.0
 DEFAULT_V_MAX = 30.0
@@ -109,7 +110,7 @@ class DemoDefinition:
 class ActiveDemo:
     definition: DemoDefinition
     esc_ids: list[int]
-    handle: DemoHandle | None
+    start_time: float
 
 
 DEMO_DEFINITIONS: list[DemoDefinition] = [
@@ -211,7 +212,7 @@ class MotorTable(DataTable):
                 delta = max(0.0, now - info.last_seen)
                 last_seen = f"{delta:0.1f}s ago"
                 status = "Active" if delta < 2.0 else "Quiet"
-            name = record.name if record and record.name else "--"
+            name = record.name or "--" if record else "--"
             row_key = str(esc_id)
             self.add_row(
                 f"0x{esc_id:02X}",
@@ -801,20 +802,21 @@ class DmTuiApp(App[None]):
         self._telemetry_history: Dict[int, Deque[float]] = {}
         self._torque_history: Dict[int, Deque[float]] = {}
         self._temp_history: Dict[int, Deque[int]] = {}
+        config_dir = config_path.expanduser().parent if config_path is not None else DEFAULT_CONFIG_DIR
+        self._telemetry_log_path = config_dir / "telemetry.csv"
+        self._telemetry_log_writer: "TelemetryCsvWriter | None" = None
+        self._telemetry_log_error = False
         self._groups: Dict[str, GroupRecord] = {
             group.name: GroupRecord(name=group.name, esc_ids=list(group.esc_ids))
             for group in self._config.groups
         }
-        config_dir = (
-            config_path.expanduser().parent if config_path else DEFAULT_CONFIG_DIR
-        )
-        self._telemetry_log_path = config_dir / "telemetry.csv"
-        self._telemetry_log_writer: telemetry_logging.TelemetryCsvWriter | None = None
-        self._telemetry_log_failed = False
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
+        self._demo_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
+        self._demo_tasks: list[PeriodicTask] = []
+        self._demo_uses_periodic = False
         self._discovery_running = False
         self._bus_stats_running = False
         self.active_bus = self._config.active_bus
@@ -1187,42 +1189,117 @@ class DmTuiApp(App[None]):
             self._log("[red]Cannot start demo; bus offline.[/red]")
             return
         self._stop_demo(disable=False)
-        try:
-            handle = sine_orchestra(
-                self._bus_manager,
-                esc_ids,
-                amplitude_rps=definition.amplitude_rps,
-                frequency_hz=definition.frequency_hz,
-                mode=definition.mode,
-            )
-        except (BusManagerError, ValueError) as exc:
-            self._log(f"[red]Failed to start demo:[/red] {exc}")
-            return
-        self._active_demo = ActiveDemo(definition=definition, esc_ids=list(esc_ids), handle=handle)
+        self._active_demo = ActiveDemo(definition=definition, esc_ids=esc_ids, start_time=monotonic())
+        self._demo_tasks = []
+        self._demo_uses_periodic = False
+        period_hz = max(20.0, definition.frequency_hz * 16.0)
+        fallback_required = False
+        for esc in esc_ids:
+            arb_id, payload = protocol.frame_speed(esc, 0.0)
+            try:
+                task = self._bus_manager.send_periodic(arb_id, payload, hz=period_hz)
+            except BusManagerError as exc:
+                self._log(
+                    f"[yellow]Periodic scheduling unavailable for ESC 0x{esc:02X}; falling back to direct sends.[/yellow] ({exc})"
+                )
+                for handle in self._demo_tasks:
+                    try:
+                        handle.stop()
+                    except Exception:
+                        pass
+                self._demo_tasks.clear()
+                fallback_required = True
+                break
+            else:
+                self._demo_tasks.append(task)
+        if self._demo_tasks:
+            self._demo_uses_periodic = True
+        elif fallback_required:
+            self._log("Using timer-driven commands for demo execution.")
+        self._demo_timer = self.set_interval(0.05, self._demo_tick)
         self._log(f"Starting demo '{definition.title}' using {label} ({len(esc_ids)} motors).")
 
+    def _demo_tick(self) -> None:  # pragma: no cover - timing sensitive
+        if not self._bus_manager or not self._active_demo:
+            self._stop_demo(disable=False)
+            return
+        demo = self._active_demo
+        t = monotonic() - demo.start_time
+        count = len(demo.esc_ids)
+        velocities = [
+            self._compute_demo_velocity(demo.definition, t, index, count)
+            for index, _ in enumerate(demo.esc_ids)
+        ]
+        if self._demo_tasks:
+            for index, esc_id in enumerate(demo.esc_ids):
+                _, payload = protocol.frame_speed(esc_id, velocities[index])
+                try:
+                    self._demo_tasks[index].update(data=payload)
+                except Exception as exc:
+                    self.call_from_thread(self._log, f"[red]Demo halted:[/red] {exc}")
+                    self.call_from_thread(self._stop_demo, True)
+                    break
+        else:
+            targets = [
+                MotorTarget(esc_id=esc, velocity_rad_s=vel)
+                for esc, vel in zip(demo.esc_ids, velocities)
+            ]
+            try:
+                command_velocities(self._bus_manager, targets)
+            except BusManagerError as exc:
+                self.call_from_thread(self._log, f"[red]Demo halted (send error):[/red] {exc}")
+                self.call_from_thread(self._stop_demo, True)
+
     def _stop_demo(self, disable: bool) -> None:
+        if self._demo_timer is not None:
+            self._demo_timer.stop()
+            self._demo_timer = None
+        if self._demo_tasks:
+            for task in list(self._demo_tasks):
+                try:
+                    task.stop()
+                except Exception:
+                    pass
+            self._demo_tasks.clear()
+        self._demo_uses_periodic = False
         if not self._active_demo:
             return
         demo = self._active_demo
         self._active_demo = None
-        if demo.handle is not None:
-            try:
-                demo.handle.stop()
-            except Exception:
-                pass
         if self._bus_manager:
             try:
                 if disable:
                     disable_all(self._bus_manager, demo.esc_ids)
                 else:
-                    brake_to_zero(self._bus_manager, demo.esc_ids)
+                    targets = [MotorTarget(esc_id=esc, velocity_rad_s=0.0) for esc in demo.esc_ids]
+                    command_velocities(self._bus_manager, targets)
             except BusManagerError:
                 pass
         if disable:
             self._log("Demo stopped and motors disabled.")
         else:
             self._log("Demo stopped.")
+
+    def _compute_demo_velocity(
+        self,
+        definition: DemoDefinition,
+        t: float,
+        index: int,
+        count: int,
+    ) -> float:
+        phase_base = 2 * math.pi * definition.frequency_hz * t
+        if count <= 1:
+            return definition.amplitude_rps * math.sin(phase_base)
+        if definition.mode == "sine":
+            phase = phase_base + (2 * math.pi * index / count)
+            return definition.amplitude_rps * math.sin(phase)
+        if definition.mode == "antiphase":
+            phase = phase_base + (math.pi if index % 2 else 0)
+            return definition.amplitude_rps * math.sin(phase)
+        if definition.mode == "figure8":
+            phase = phase_base + (index * math.pi / 2)
+            return definition.amplitude_rps * math.sin(phase)
+        return definition.amplitude_rps * math.sin(phase_base)
 
     def _schedule_discovery(self, *, force_active: bool = False) -> None:
         if not self._mounted or self._bus_manager is None:
@@ -1301,7 +1378,6 @@ class DmTuiApp(App[None]):
             v_max=limits[1],
             t_max=limits[2],
         )
-        self._append_telemetry_log(engineering, mst_id=mst_id, timestamp=timestamp)
         telemetry_record = TelemetryRecord(
             feedback=feedback,
             timestamp=timestamp,
@@ -1310,6 +1386,20 @@ class DmTuiApp(App[None]):
             torque_nm=engineering.torque_nm,
         )
         self._telemetry[esc_id] = telemetry_record
+        writer = self._ensure_telemetry_log()
+        if writer is not None:
+            try:
+                from . import logging as telemetry_logging
+
+                row = telemetry_logging.telemetry_row_from_engineering(
+                    engineering,
+                    mst_id=mst_id,
+                    timestamp=timestamp,
+                )
+                writer.write_row(row)
+            except Exception as exc:  # pragma: no cover - depends on filesystem
+                self._log(f"[red]Telemetry log write failed:[/red] {exc}")
+                self._close_telemetry_log(mark_error=True)
         velocity_history = self._telemetry_history.setdefault(esc_id, deque(maxlen=200))
         velocity_history.append(engineering.velocity_rad_s)
         torque_history = self._torque_history.setdefault(esc_id, deque(maxlen=200))
@@ -1335,7 +1425,7 @@ class DmTuiApp(App[None]):
             self._refresh_telemetry_panel()
             self._refresh_detail_panel()
             self._refresh_velocity_sparkline()
-        self._reapply_filters()
+            self._reapply_filters()
         if config_changed:
             self._persist_config()
 
@@ -1421,50 +1511,34 @@ class DmTuiApp(App[None]):
             self._bus_manager.close()
             self._bus_manager = None
 
-    def _ensure_telemetry_log(
-        self,
-    ) -> telemetry_logging.TelemetryCsvWriter | None:
-        if self._telemetry_log_failed:
+    def _ensure_telemetry_log(self) -> "TelemetryCsvWriter | None":
+        if self._telemetry_log_writer is not None:
+            return self._telemetry_log_writer
+        if self._telemetry_log_error:
             return None
-        if self._telemetry_log_writer is None:
-            try:
-                self._telemetry_log_writer = telemetry_logging.open_csv(
-                    self._telemetry_log_path
-                )
-            except OSError as exc:
-                self._telemetry_log_failed = True
-                self._log(
-                    f"[yellow]Telemetry logging disabled:[/yellow] {exc}"
-                )
-                return None
+        try:
+            from . import logging as telemetry_logging
+
+            self._telemetry_log_writer = telemetry_logging.open_csv(self._telemetry_log_path)
+        except Exception as exc:  # pragma: no cover - filesystem/permissions dependent
+            self._telemetry_log_error = True
+            self._log(f"[red]Telemetry log unavailable:[/red] {exc}")
+            self._telemetry_log_writer = None
         return self._telemetry_log_writer
 
-    def _append_telemetry_log(
-        self,
-        engineering: protocol.FeedbackEngineering,
-        *,
-        mst_id: int,
-        timestamp: float,
-    ) -> None:
-        writer = self._ensure_telemetry_log()
+    def _close_telemetry_log(self, *, mark_error: bool = False) -> None:
+        writer = self._telemetry_log_writer
         if writer is None:
             return
-        row = telemetry_logging.telemetry_row_from_engineering(
-            engineering, mst_id=mst_id, timestamp=timestamp
-        )
+        self._telemetry_log_writer = None
         try:
-            writer.write_row(row)
-        except Exception as exc:  # pragma: no cover - unexpected filesystem errors
-            self._log(f"[yellow]Failed to append telemetry log:[/yellow] {exc}")
-            self._telemetry_log_failed = True
-            self._close_telemetry_log()
-
-    def _close_telemetry_log(self) -> None:
-        if self._telemetry_log_writer is not None:
-            try:
-                self._telemetry_log_writer.close()
-            finally:
-                self._telemetry_log_writer = None
+            writer.close()
+        except Exception as exc:  # pragma: no cover - depends on filesystem
+            self._log(f"[red]Telemetry log close failed:[/red] {exc}")
+            self._telemetry_log_error = True
+        else:
+            if mark_error:
+                self._telemetry_log_error = True
 
     def _persist_config(self) -> None:
         self._config.motors = list(self._motor_records.values())
