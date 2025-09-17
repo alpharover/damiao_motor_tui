@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from struct import pack
 from typing import Iterable
 
@@ -11,6 +12,12 @@ from . import params
 ENABLE_FRAME = bytes([0xFF] * 7 + [0xFC])
 DISABLE_FRAME = bytes([0xFF] * 7 + [0xFD])
 ZERO_FRAME = bytes([0xFF] * 7 + [0xFE])
+
+MIT_DEFAULT_POSITION_LIMIT = 12.0
+MIT_DEFAULT_VELOCITY_LIMIT = 30.0
+MIT_DEFAULT_TORQUE_LIMIT = 20.0
+MIT_DEFAULT_KP_LIMIT = 400.0
+MIT_DEFAULT_KD_LIMIT = 10.0
 
 
 @dataclass(slots=True)
@@ -72,6 +79,104 @@ def frame_position_speed(esc_id: int, position_rad: float, velocity_rad_s: float
     return 0x100 + esc_id, payload
 
 
+def frame_mit(
+    esc_id: int,
+    *,
+    position_rad: float,
+    velocity_rad_s: float,
+    torque_nm: float,
+    kp: float,
+    kd: float,
+    position_limit: float = MIT_DEFAULT_POSITION_LIMIT,
+    velocity_limit: float = MIT_DEFAULT_VELOCITY_LIMIT,
+    torque_limit: float = MIT_DEFAULT_TORQUE_LIMIT,
+    kp_limit: float = MIT_DEFAULT_KP_LIMIT,
+    kd_limit: float = MIT_DEFAULT_KD_LIMIT,
+) -> tuple[int, bytes]:
+    payload = pack_mit_payload(
+        position_rad=position_rad,
+        velocity_rad_s=velocity_rad_s,
+        torque_nm=torque_nm,
+        kp=kp,
+        kd=kd,
+        position_limit=position_limit,
+        velocity_limit=velocity_limit,
+        torque_limit=torque_limit,
+        kp_limit=kp_limit,
+        kd_limit=kd_limit,
+    )
+    return 0x300 + esc_id, payload
+
+
+def pack_mit_payload(
+    *,
+    position_rad: float,
+    velocity_rad_s: float,
+    torque_nm: float,
+    kp: float,
+    kd: float,
+    position_limit: float = MIT_DEFAULT_POSITION_LIMIT,
+    velocity_limit: float = MIT_DEFAULT_VELOCITY_LIMIT,
+    torque_limit: float = MIT_DEFAULT_TORQUE_LIMIT,
+    kp_limit: float = MIT_DEFAULT_KP_LIMIT,
+    kd_limit: float = MIT_DEFAULT_KD_LIMIT,
+) -> bytes:
+    p_min, p_max = -abs(position_limit), abs(position_limit)
+    v_min, v_max = -abs(velocity_limit), abs(velocity_limit)
+    t_min, t_max = -abs(torque_limit), abs(torque_limit)
+    kp_min, kp_max = 0.0, abs(kp_limit)
+    kd_min, kd_max = 0.0, abs(kd_limit)
+
+    p_int = _float_to_uint(position_rad, p_min, p_max, bits=16)
+    v_int = _float_to_uint(velocity_rad_s, v_min, v_max, bits=12)
+    kp_int = _float_to_uint(kp, kp_min, kp_max, bits=12)
+    kd_int = _float_to_uint(kd, kd_min, kd_max, bits=12)
+    t_int = _float_to_uint(torque_nm, t_min, t_max, bits=12)
+
+    payload = bytearray(8)
+    payload[0] = (p_int >> 8) & 0xFF
+    payload[1] = p_int & 0xFF
+    payload[2] = (v_int >> 4) & 0xFF
+    payload[3] = ((v_int & 0x0F) << 4) | ((kp_int >> 8) & 0x0F)
+    payload[4] = kp_int & 0xFF
+    payload[5] = (kd_int >> 4) & 0xFF
+    payload[6] = ((kd_int & 0x0F) << 4) | ((t_int >> 8) & 0x0F)
+    payload[7] = t_int & 0xFF
+    return bytes(payload)
+
+
+def decode_mit(
+    payload: bytes,
+    *,
+    position_limit: float = MIT_DEFAULT_POSITION_LIMIT,
+    velocity_limit: float = MIT_DEFAULT_VELOCITY_LIMIT,
+    torque_limit: float = MIT_DEFAULT_TORQUE_LIMIT,
+    kp_limit: float = MIT_DEFAULT_KP_LIMIT,
+    kd_limit: float = MIT_DEFAULT_KD_LIMIT,
+) -> tuple[float, float, float, float, float]:
+    if len(payload) != 8:
+        raise ValueError("MIT command payload must be 8 bytes")
+
+    p_int = (payload[0] << 8) | payload[1]
+    v_int = (payload[2] << 4) | (payload[3] >> 4)
+    kp_int = ((payload[3] & 0x0F) << 8) | payload[4]
+    kd_int = (payload[5] << 4) | (payload[6] >> 4)
+    t_int = ((payload[6] & 0x0F) << 8) | payload[7]
+
+    p_min, p_max = -abs(position_limit), abs(position_limit)
+    v_min, v_max = -abs(velocity_limit), abs(velocity_limit)
+    t_min, t_max = -abs(torque_limit), abs(torque_limit)
+    kp_min, kp_max = 0.0, abs(kp_limit)
+    kd_min, kd_max = 0.0, abs(kd_limit)
+
+    position = _uint_to_float(p_int, p_min, p_max, bits=16)
+    velocity = _uint_to_float(v_int, v_min, v_max, bits=12)
+    kp = _uint_to_float(kp_int, kp_min, kp_max, bits=12)
+    kd = _uint_to_float(kd_int, kd_min, kd_max, bits=12)
+    torque = _uint_to_float(t_int, t_min, t_max, bits=12)
+    return position, velocity, torque, kp, kd
+
+
 def decode_feedback(data: bytes) -> Feedback:
     if len(data) != 8:
         raise ValueError("Feedback frame must be 8 bytes")
@@ -120,6 +225,27 @@ def _to_signed(value: int, *, bits: int) -> int:
     return (value ^ sign_bit) - sign_bit
 
 
+def _float_to_uint(value: float, minimum: float, maximum: float, *, bits: int) -> int:
+    if maximum <= minimum:
+        raise ValueError("maximum must be greater than minimum")
+    if not isfinite(value):
+        raise ValueError("value must be finite")
+    span = maximum - minimum
+    scale = (1 << bits) - 1
+    clamped = max(min(value, maximum), minimum)
+    normalized = (clamped - minimum) / span
+    return int(round(normalized * scale)) & scale
+
+
+def _uint_to_float(value: int, minimum: float, maximum: float, *, bits: int) -> float:
+    if maximum <= minimum:
+        raise ValueError("maximum must be greater than minimum")
+    scale = (1 << bits) - 1
+    value &= scale
+    span = maximum - minimum
+    return (value / scale) * span + minimum
+
+
 __all__ = [
     "Feedback",
     "FeedbackEngineering",
@@ -128,8 +254,16 @@ __all__ = [
     "frame_zero",
     "frame_speed",
     "frame_position_speed",
+    "frame_mit",
+    "pack_mit_payload",
+    "decode_mit",
     "decode_feedback",
     "build_filters",
     "frame_param_write",
     "frame_param_save",
+    "MIT_DEFAULT_POSITION_LIMIT",
+    "MIT_DEFAULT_VELOCITY_LIMIT",
+    "MIT_DEFAULT_TORQUE_LIMIT",
+    "MIT_DEFAULT_KP_LIMIT",
+    "MIT_DEFAULT_KD_LIMIT",
 ]

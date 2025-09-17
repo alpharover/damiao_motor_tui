@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from .bus_manager import BusManager, BusManagerError
 from .controllers import (
     MotorTarget,
     assign_motor_ids,
+    command_mit,
     command_velocity,
     command_velocities,
     enable_all,
@@ -54,6 +56,25 @@ if TYPE_CHECKING:
 DEFAULT_P_MAX = 12.0
 DEFAULT_V_MAX = 30.0
 DEFAULT_T_MAX = 20.0
+DEFAULT_KP_MAX = protocol.MIT_DEFAULT_KP_LIMIT
+DEFAULT_KD_MAX = protocol.MIT_DEFAULT_KD_LIMIT
+
+
+def _parse_env_float(name: str, default: float) -> float:
+    """Return a float from *name* env var, falling back to *default* on errors."""
+
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+WATCHDOG_THRESHOLD_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_THRESHOLD", 3.0)
+WATCHDOG_COOLDOWN_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_COOLDOWN", 5.0)
+WATCHDOG_INTERVAL_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_INTERVAL", 1.0)
 
 
 def _parse_optional_float(value: str) -> float | None:
@@ -95,6 +116,15 @@ class MetadataUpdate:
 class GroupDefinition:
     name: str
     esc_ids: list[int]
+
+
+@dataclass(slots=True)
+class MitCommand:
+    position_rad: float
+    velocity_rad_s: float
+    torque_nm: float
+    kp: float
+    kd: float
 
 
 @dataclass(slots=True)
@@ -199,20 +229,43 @@ class MotorTable(DataTable):
         motors: Dict[int, MotorInfo],
         records: Dict[int, MotorRecord],
         now: float,
+        *,
+        telemetry: Dict[int, "TelemetryRecord"] | None = None,
+        watchdog_tripped: set[int] | None = None,
+        last_disable: Dict[int, float] | None = None,
     ) -> None:
         self.clear()
         self._row_keys.clear()
-        esc_ids = sorted(set(records.keys()) | set(motors.keys()))
+        esc_ids = sorted(set(records.keys()) | set(motors.keys()) | set(telemetry.keys() if telemetry else []))
         for esc_id in esc_ids:
             record = records.get(esc_id)
             info = motors.get(esc_id)
+            telemetry_record = telemetry.get(esc_id) if telemetry else None
             mst_id = info.mst_id if info else (record.mst_id if record else 0)
-            last_seen = "--"
-            status = "Configured"
+            last_seen_value: float | None = None
             if info:
-                delta = max(0.0, now - info.last_seen)
+                last_seen_value = info.last_seen
+            if telemetry_record is not None:
+                last_seen_value = (
+                    telemetry_record.timestamp
+                    if last_seen_value is None
+                    else max(last_seen_value, telemetry_record.timestamp)
+                )
+            status = "Configured"
+            delta = None
+            if last_seen_value is not None:
+                delta = max(0.0, now - last_seen_value)
                 last_seen = f"{delta:0.1f}s ago"
                 status = "Active" if delta < 2.0 else "Quiet"
+            else:
+                last_seen = "--"
+            triggered = bool(watchdog_tripped and esc_id in watchdog_tripped)
+            if triggered:
+                status = "[red]Watchdog[/red]"
+                if last_disable and esc_id in last_disable:
+                    since_disable = max(0.0, now - last_disable[esc_id])
+                    status = f"[red]Watchdog[/red] ({since_disable:0.1f}s ago)"
+                last_seen = f"[red]{last_seen}[/red]"
             name = record.name if record and record.name else "--"
             row_key = str(esc_id)
             self.add_row(
@@ -276,6 +329,7 @@ class HintPanel(Static):
                     "B      Cycle Bus",
                     "E/D/Z Enable/Disable/Zero",
                     "V      Set Velocity",
+                    "T      MIT Command",
                     "A      ID Wizard",
                     "M      Edit Metadata",
                     "Ctrl+M Edit Groups",
@@ -311,6 +365,8 @@ class MotorDetailPanel(Static):
         info: MotorInfo | None,
         telemetry: TelemetryRecord | None,
         now: float,
+        watchdog_active: bool = False,
+        watchdog_last: float | None = None,
     ) -> None:
         if telemetry:
             delta = now - telemetry.timestamp
@@ -340,6 +396,13 @@ class MotorDetailPanel(Static):
         if delta is not None:
             status = "Fresh" if delta < 1.0 else "Stale"
             lines.append(f"[b]Telemetry[/b] {status} ({delta:0.1f}s old)")
+        if watchdog_active:
+            if watchdog_last is not None:
+                lines.append(
+                    f"[red]Watchdog auto-disable[/red] {max(0.0, now - watchdog_last):0.1f}s ago."
+                )
+            else:
+                lines.append("[red]Watchdog auto-disable active.[/red]")
         self.update("\n".join(lines))
 
 
@@ -480,6 +543,157 @@ class VelocityModal(ModalScreen[Optional[float]]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         apply_button = self.query_one("#apply", Button)
         self.on_button_pressed(Button.Pressed(apply_button))
+
+
+class MitModal(ModalScreen[Optional[MitCommand]]):
+    """Collect MIT-mode setpoint parameters for a single motor."""
+
+    def __init__(
+        self,
+        esc_id: int,
+        *,
+        defaults: MitCommand | None = None,
+        position_limit: float,
+        velocity_limit: float,
+        torque_limit: float,
+        kp_limit: float,
+        kd_limit: float,
+    ) -> None:
+        super().__init__()
+        self._esc_id = esc_id
+        self._defaults = defaults or MitCommand(0.0, 0.0, 0.0, 0.0, 0.0)
+        self._position_limit = abs(position_limit)
+        self._velocity_limit = abs(velocity_limit)
+        self._torque_limit = abs(torque_limit)
+        self._kp_limit = abs(kp_limit)
+        self._kd_limit = abs(kd_limit)
+        self._error: Label | None = None
+        self._position_input: Input | None = None
+        self._velocity_input: Input | None = None
+        self._torque_input: Input | None = None
+        self._kp_input: Input | None = None
+        self._kd_input: Input | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"MIT command for ESC 0x{self._esc_id:02X}", id="mit-title")
+        self._position_input = Input(
+            self._format_default(self._defaults.position_rad),
+            placeholder=f"Position ±{self._position_limit:0.2f} rad",
+            id="mit-position",
+        )
+        yield self._position_input
+        self._velocity_input = Input(
+            self._format_default(self._defaults.velocity_rad_s),
+            placeholder=f"Velocity ±{self._velocity_limit:0.2f} rad/s",
+            id="mit-velocity",
+        )
+        yield self._velocity_input
+        self._torque_input = Input(
+            self._format_default(self._defaults.torque_nm),
+            placeholder=f"Torque ±{self._torque_limit:0.2f} Nm",
+            id="mit-torque",
+        )
+        yield self._torque_input
+        self._kp_input = Input(
+            self._format_default(self._defaults.kp),
+            placeholder=f"Kp 0–{self._kp_limit:0.2f}",
+            id="mit-kp",
+        )
+        yield self._kp_input
+        self._kd_input = Input(
+            self._format_default(self._defaults.kd),
+            placeholder=f"Kd 0–{self._kd_limit:0.2f}",
+            id="mit-kd",
+        )
+        yield self._kd_input
+        self._error = Label("", id="mit-error")
+        yield self._error
+        with Horizontal(id="mit-buttons"):
+            yield Button("Cancel", id="cancel")
+            yield Button("Apply", id="apply", variant="primary")
+
+    def _format_default(self, value: float) -> str:
+        return "" if abs(value) < 1e-9 else f"{value:0.3f}"
+
+    def on_mount(self, event: Mount) -> None:  # noqa: D401
+        if self._position_input:
+            self.set_focus(self._position_input)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        try:
+            command = MitCommand(
+                position_rad=self._parse_value(
+                    self._position_input,
+                    name="Position",
+                    minimum=-self._position_limit,
+                    maximum=self._position_limit,
+                    default=self._defaults.position_rad,
+                ),
+                velocity_rad_s=self._parse_value(
+                    self._velocity_input,
+                    name="Velocity",
+                    minimum=-self._velocity_limit,
+                    maximum=self._velocity_limit,
+                    default=self._defaults.velocity_rad_s,
+                ),
+                torque_nm=self._parse_value(
+                    self._torque_input,
+                    name="Torque",
+                    minimum=-self._torque_limit,
+                    maximum=self._torque_limit,
+                    default=self._defaults.torque_nm,
+                ),
+                kp=self._parse_value(
+                    self._kp_input,
+                    name="Kp",
+                    minimum=0.0,
+                    maximum=self._kp_limit,
+                    default=self._defaults.kp,
+                ),
+                kd=self._parse_value(
+                    self._kd_input,
+                    name="Kd",
+                    minimum=0.0,
+                    maximum=self._kd_limit,
+                    default=self._defaults.kd,
+                ),
+            )
+        except ValueError as exc:
+            if self._error:
+                self._error.update(str(exc))
+            return
+        self.dismiss(command)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        apply_button = self.query_one("#apply", Button)
+        self.on_button_pressed(Button.Pressed(apply_button))
+
+    def _parse_value(
+        self,
+        widget: Input | None,
+        *,
+        name: str,
+        minimum: float,
+        maximum: float,
+        default: float,
+    ) -> float:
+        if widget is None:
+            return default
+        text = widget.value.strip()
+        if not text:
+            return default
+        try:
+            value = float(text)
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Enter a numeric {name} value.") from exc
+        if value < minimum or value > maximum:
+            raise ValueError(
+                f"{name} must be between {minimum:0.2f} and {maximum:0.2f}."
+            )
+        return value
 
 
 class GroupVelocityModal(ModalScreen[Optional[float]]):
@@ -774,6 +988,7 @@ class DmTuiApp(App[None]):
         Binding("d", "disable_selected", "Disable", show=True),
         Binding("z", "zero_selected", "Zero", show=True),
         Binding("v", "set_velocity", "Velocity", show=True),
+        Binding("t", "set_mit", "MIT Cmd", show=True),
         Binding("a", "assign_ids", "Assign IDs", show=True),
         Binding("m", "edit_metadata", "Edit Metadata", show=True),
         Binding("ctrl+m", "manage_groups", "Edit Groups", show=True),
@@ -814,9 +1029,15 @@ class DmTuiApp(App[None]):
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
+        self._watchdog_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
         self._discovery_running = False
         self._bus_stats_running = False
+        self._watchdog_threshold = WATCHDOG_THRESHOLD_SECONDS
+        self._watchdog_cooldown = max(WATCHDOG_COOLDOWN_SECONDS, self._watchdog_threshold)
+        self._watchdog_interval = max(WATCHDOG_INTERVAL_SECONDS, 0.2)
+        self._watchdog_last_disable: Dict[int, float] = {}
+        self._watchdog_tripped: set[int] = set()
         self.active_bus = self._config.active_bus
 
     def compose(self) -> ComposeResult:
@@ -843,12 +1064,15 @@ class DmTuiApp(App[None]):
         self._open_bus(self.active_bus)
         self._bus_stats_timer = self.set_interval(3.0, self._schedule_bus_stats_refresh)
         self._discovery_timer = self.set_interval(4.0, self._schedule_discovery)
+        self._watchdog_timer = self.set_interval(self._watchdog_interval, self._watchdog_check)
 
     def on_unmount(self) -> None:
         if self._bus_stats_timer:
             self._bus_stats_timer.stop()
         if self._discovery_timer:
             self._discovery_timer.stop()
+        if self._watchdog_timer:
+            self._watchdog_timer.stop()
         self._stop_demo(disable=False)
         self._close_bus()
         self._close_telemetry_log()
@@ -947,6 +1171,33 @@ class DmTuiApp(App[None]):
         modal = VelocityModal(esc_id, default)
         self.push_screen(modal, callback=lambda value: self._apply_velocity(esc_id, value))
 
+    def action_set_mit(self) -> None:
+        esc_id = self._require_selected_motor()
+        if esc_id is None or not self._bus_manager:
+            return
+        telemetry = self._telemetry.get(esc_id)
+        defaults = MitCommand(
+            position_rad=telemetry.position_rad if telemetry else 0.0,
+            velocity_rad_s=telemetry.velocity_rad_s if telemetry else 0.0,
+            torque_nm=0.0,
+            kp=0.0,
+            kd=0.0,
+        )
+        limits = self._resolve_mit_limits(esc_id)
+        modal = MitModal(
+            esc_id,
+            defaults=defaults,
+            position_limit=limits[0],
+            velocity_limit=limits[1],
+            torque_limit=limits[2],
+            kp_limit=limits[3],
+            kd_limit=limits[4],
+        )
+        self.push_screen(
+            modal,
+            callback=lambda command, esc=esc_id, lim=limits: self._apply_mit(esc, command, lim),
+        )
+
     def action_assign_ids(self) -> None:
         esc_id = self._require_selected_motor()
         if esc_id is None:
@@ -1021,6 +1272,65 @@ class DmTuiApp(App[None]):
             self._log(f"[red]Velocity command failed:[/red] {exc}")
         else:
             self._log(f"Velocity {value:0.2f} rad/s sent to ESC 0x{esc_id:02X}.")
+
+    def _apply_mit(
+        self,
+        esc_id: int,
+        command: Optional[MitCommand],
+        limits: tuple[float, float, float, float, float],
+    ) -> None:
+        if command is None:
+            return
+        if not self._bus_manager:
+            self._log("[red]MIT command ignored; bus offline.[/red]")
+            return
+        position_limit, velocity_limit, torque_limit, kp_limit, kd_limit = limits
+        sanitized, adjustments = self._sanitize_mit_command(command, limits)
+        self._stop_demo(disable=False)
+        try:
+            command_mit(
+                self._bus_manager,
+                esc_id,
+                position_rad=sanitized.position_rad,
+                velocity_rad_s=sanitized.velocity_rad_s,
+                torque_nm=sanitized.torque_nm,
+                kp=sanitized.kp,
+                kd=sanitized.kd,
+                position_limit=position_limit,
+                velocity_limit=velocity_limit,
+                torque_limit=torque_limit,
+                kp_limit=kp_limit,
+                kd_limit=kd_limit,
+            )
+        except BusManagerError as exc:  # pragma: no cover
+            self._log(f"[red]MIT command failed:[/red] {exc}")
+        else:
+            if adjustments:
+                self._log(f"[yellow]MIT command clamped ({', '.join(adjustments)}).[/yellow]")
+            self._log(f"MIT command sent to ESC 0x{esc_id:02X}.")
+
+    def _sanitize_mit_command(
+        self,
+        command: MitCommand,
+        limits: tuple[float, float, float, float, float],
+    ) -> tuple[MitCommand, list[str]]:
+        position_limit, velocity_limit, torque_limit, kp_limit, kd_limit = limits
+        adjustments: list[str] = []
+
+        def clamp(value: float, minimum: float, maximum: float, label: str) -> float:
+            clamped = max(min(value, maximum), minimum)
+            if abs(clamped - value) > 1e-6:
+                adjustments.append(label)
+            return clamped
+
+        sanitized = MitCommand(
+            position_rad=clamp(command.position_rad, -abs(position_limit), abs(position_limit), "position"),
+            velocity_rad_s=clamp(command.velocity_rad_s, -abs(velocity_limit), abs(velocity_limit), "velocity"),
+            torque_nm=clamp(command.torque_nm, -abs(torque_limit), abs(torque_limit), "torque"),
+            kp=clamp(command.kp, 0.0, abs(kp_limit), "kp"),
+            kd=clamp(command.kd, 0.0, abs(kd_limit), "kd"),
+        )
+        return sanitized, adjustments
 
     def _handle_group_action(self, result: Optional[tuple[str, str]]) -> None:
         if result is None:
@@ -1239,8 +1549,64 @@ class DmTuiApp(App[None]):
         with self._threads_lock:
             if self._bus_stats_running:
                 return
-            self._bus_stats_running = True
+        self._bus_stats_running = True
         threading.Thread(target=self._bus_stats_worker, daemon=True).start()
+
+    def _watchdog_check(self) -> None:
+        bus = self._bus_manager
+        if bus is None:
+            return
+        now = monotonic()
+        threshold = self._watchdog_threshold
+        cooldown = self._watchdog_cooldown
+        changed = False
+        stale: list[tuple[int, float]] = []
+        esc_ids = set(self._motors.keys()) | set(self._telemetry.keys())
+        for esc_id in esc_ids:
+            info = self._motors.get(esc_id)
+            telemetry = self._telemetry.get(esc_id)
+            last_seen: float | None = None
+            if info is not None:
+                last_seen = info.last_seen
+            if telemetry is not None:
+                last_seen = (
+                    telemetry.timestamp
+                    if last_seen is None
+                    else max(last_seen, telemetry.timestamp)
+                )
+            if last_seen is None:
+                continue
+            age = now - last_seen
+            if age < threshold:
+                if esc_id in self._watchdog_tripped:
+                    self._watchdog_tripped.discard(esc_id)
+                    changed = True
+                continue
+            if esc_id not in self._watchdog_tripped:
+                self._watchdog_tripped.add(esc_id)
+                changed = True
+            last_disable = self._watchdog_last_disable.get(esc_id)
+            if last_disable is not None and (now - last_disable) < cooldown:
+                continue
+            stale.append((esc_id, age))
+        if not stale:
+            if changed and self._mounted:
+                self._refresh_motor_table()
+                self._refresh_detail_panel()
+            return
+        for esc_id, age in stale:
+            try:
+                disable(bus, esc_id)
+            except BusManagerError as exc:  # pragma: no cover - hardware dependent
+                self._log(f"[red]Watchdog disable failed for ESC 0x{esc_id:02X}:[/red] {exc}")
+            else:
+                self._log(
+                    f"[red]Watchdog:[/red] ESC 0x{esc_id:02X} stale ({age:0.1f}s); issued disable."
+                )
+            self._watchdog_last_disable[esc_id] = now
+        if self._mounted:
+            self._refresh_motor_table()
+            self._refresh_detail_panel()
 
     def _discovery_worker(self, force_active: bool) -> None:
         try:
@@ -1309,6 +1675,9 @@ class DmTuiApp(App[None]):
             torque_nm=engineering.torque_nm,
         )
         self._telemetry[esc_id] = telemetry_record
+        if esc_id in self._watchdog_tripped:
+            self._watchdog_tripped.discard(esc_id)
+        self._watchdog_last_disable.pop(esc_id, None)
         writer = self._ensure_telemetry_log()
         if writer is not None:
             try:
@@ -1362,7 +1731,14 @@ class DmTuiApp(App[None]):
 
     def _refresh_motor_table(self) -> None:
         table = self.query_one(MotorTable)
-        table.update_rows(self._motors, self._motor_records, monotonic())
+        table.update_rows(
+            self._motors,
+            self._motor_records,
+            monotonic(),
+            telemetry=self._telemetry,
+            watchdog_tripped=self._watchdog_tripped,
+            last_disable=self._watchdog_last_disable,
+        )
         available = table.available_esc_ids()
         if not available:
             self.selected_esc = None
@@ -1384,6 +1760,8 @@ class DmTuiApp(App[None]):
             info=self._motors.get(esc_id),
             telemetry=self._telemetry.get(esc_id),
             now=monotonic(),
+            watchdog_active=esc_id in self._watchdog_tripped,
+            watchdog_last=self._watchdog_last_disable.get(esc_id),
         )
         self._refresh_velocity_sparkline()
 
@@ -1420,6 +1798,8 @@ class DmTuiApp(App[None]):
         self._telemetry_history.clear()
         self._torque_history.clear()
         self._temp_history.clear()
+        self._watchdog_tripped.clear()
+        self._watchdog_last_disable.clear()
         manager.register_listener(self._handle_bus_message)
         self._reapply_filters()
         self._log(f"Connected to {channel}.")
@@ -1506,6 +1886,24 @@ class DmTuiApp(App[None]):
         t_max = float(metadata.get("t_max", metadata.get("T_MAX", DEFAULT_T_MAX)))
         return p_max, v_max, t_max
 
+    def _resolve_mit_limits(self, esc_id: int) -> tuple[float, float, float, float, float]:
+        p_max, v_max, t_max = self._resolve_limits(esc_id)
+        record = self._motor_records.get(esc_id)
+        metadata = record.metadata if record else {}
+
+        def _coerce(value: object, default: float) -> float:
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                return default
+            return abs(candidate) if candidate > 0 else default
+
+        kp_source = metadata.get("kp_max", metadata.get("KP_MAX"))
+        kd_source = metadata.get("kd_max", metadata.get("KD_MAX"))
+        kp_max = _coerce(kp_source, DEFAULT_KP_MAX)
+        kd_max = _coerce(kd_source, DEFAULT_KD_MAX)
+        return p_max, v_max, t_max, kp_max, kd_max
+
     def _reapply_filters(self) -> None:
         if not self._bus_manager:
             return
@@ -1540,6 +1938,7 @@ class DmTuiApp(App[None]):
 
     def get_commands(self) -> Iterable[Command]:  # pragma: no cover - UI integration
         commands = [
+            ("MIT Command", "Send MIT-mode command to the selected motor.", self.action_set_mit),
             ("Launch Demo", "Open demo launcher dialog.", self.action_launch_demo),
             ("Stop Demo", "Stop any running demo and disable motors.", self.action_stop_demo),
             ("Group Actions", "Run enable/disable/velocity against a group.", self.action_prompt_group_action),

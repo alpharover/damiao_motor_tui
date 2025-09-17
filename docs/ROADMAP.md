@@ -22,7 +22,7 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 - [ ] Implement frame pack/unpack utilities for enable/disable/zero, speed, position-speed, and MIT.
 - [ ] Decode feedback frames into engineering units leveraging RID-configured limits.
 - [ ] Implement RID read/write/save helpers for ID assignment and mode control.
-- [ ] Integrate global E-STOP and watchdog (highlight stale feedback, auto-disable if needed).
+- [x] Integrate global E-STOP and watchdog (highlight stale feedback, auto-disable if needed).
 
 ### Milestone 3 – Discovery & Configuration UX (Week 3)
 - [x] Passive sniff logic recognizing motors by feedback signature.
@@ -41,7 +41,7 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 - [ ] Implement sine orchestra, handshake duet, and figure-8 demos via `send_periodic` handles.
 - [ ] Provide demo control overlay with start/stop, amplitude/frequency tweaks, and E-STOP integration.
 - [ ] Add CSV telemetry logging and optional `candump` capture integration.
-- [ ] Document procedures for hardware validation (±30/40 rpm sweeps, braking, MIT taste test).
+- [x] Document procedures for hardware validation (±30/40 rpm sweeps, braking, MIT taste test). See [`Hardware Validation Guide`](HARDWARE_VALIDATION.md).
 
 ### Milestone 6 – Polish & Release (Week 6)
 - [ ] Harden error handling (`No buffer space`, ERR nibble decoding, bus state changes).

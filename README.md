@@ -64,7 +64,7 @@ sudo ifconfig canB txqueuelen 65536
 3. Use passive discovery first. If no motors appear, start an active probe (safe 0 rad/s cycle).
 4. Configure IDs via the wizard (writes RIDs 7/8/10, saves with 0xAA) before issuing motion commands.
 5. Leverage global E-STOP (`Space`) before editing demo scripts or periodic tasks.
-6. Cycle CAN buses with `B`, trigger discovery with `R` (safe active probe fallback), use `E/D/Z` to enable/disable/zero the highlighted motor, `V` for velocity prompts, `A` to run the ID assignment wizard, `M` to edit metadata (name, limits, group), `G` to manage groups, and persist config updates via `Ctrl+S`.
+6. Cycle CAN buses with `B`, trigger discovery with `R` (safe active probe fallback), use `E/D/Z` to enable/disable/zero the highlighted motor, `V` for velocity prompts, `T` for the MIT setpoint modal, `A` to run the ID assignment wizard, `M` to edit metadata (name, limits, group), `G` to manage groups, and persist config updates via `Ctrl+S`.
 
 ## Groups & Demos
 - Tag motors with friendly names, limits, and group memberships via `M` (metadata modal). Groups persist in the YAML config and appear in the right-hand panel.
@@ -78,15 +78,25 @@ sudo ifconfig canB txqueuelen 65536
 ### Testing Strategy
 - Unit tests on protocol packers, MIT bit packing, and feedback decoding using `vcan`.
 - Loopback smoke tests with `cangen`/`candump` to confirm filters and reader behavior.
-- Hardware validation checklist: ±30/40 rpm sweeps, synchronized braking, MIT mode responsiveness.
+- Hardware validation checklist covering ±30/40 rpm sweeps, braking, and MIT responsiveness—see [`docs/HARDWARE_VALIDATION.md`](docs/HARDWARE_VALIDATION.md).
 
 See [`docs/TESTING.md`](docs/TESTING.md) for step-by-step commands, including a `vcan` loopback recipe.
+
+## Hardware Validation
+After completing the software checks in [`docs/TESTING.md`](docs/TESTING.md), run the bench procedures in [`docs/HARDWARE_VALIDATION.md`](docs/HARDWARE_VALIDATION.md) to confirm safe motion before demos. The guide covers the ±30/40 rpm velocity sweeps, braking confidence drills, and the MIT “taste test” mentioned in the roadmap.
 
 ## Safety Considerations
 - All command frames must be 8 bytes—drives ignore shorter DLC values.
 - Always set `CTRL_MODE=3` before issuing velocity commands.
 - Watch for SocketCAN “No buffer space available” errors—usually indicates no ACK or queue saturation.
 - Use the built-in bus health screen to monitor error counters and interface state.
+- A watchdog monitors telemetry age and automatically issues `disable` to any ESC whose feedback stops for more than a few
+  seconds. Watchdog events are called out in the motor table, detail pane, and activity log so operators can spot the
+  intervention immediately.
+- Tune watchdog behaviour via environment variables before launching the TUI:
+  - `DM_TUI_WATCHDOG_THRESHOLD` (seconds of inactivity before a motor is flagged, default `3.0`).
+  - `DM_TUI_WATCHDOG_COOLDOWN` (minimum seconds between repeated disable commands per ESC, default `5.0`).
+  - `DM_TUI_WATCHDOG_INTERVAL` (poll period for the watchdog scan, default `1.0`).
 
 ## Roadmap Snapshot
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for detailed milestones (environment setup, protocol core, discovery UX, monitoring/control screens, demo polish, release prep).
