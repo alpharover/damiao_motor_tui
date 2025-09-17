@@ -374,7 +374,10 @@ class MotorControlPanel(Static):
     #motor-control-buttons {
         height: auto;
         padding-top: 1;
-        column-gap: 1;
+    }
+
+    #motor-control-buttons Button {
+        margin-right: 1;
     }
     """
 
