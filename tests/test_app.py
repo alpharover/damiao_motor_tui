@@ -145,8 +145,12 @@ def test_motor_control_panel_button_invokes_action() -> None:
         def __init__(self) -> None:
             self.called: list[str] = []
             self.console = Console()
+            self.raise_runtime = True
 
         def call_from_thread(self, func):
+            if self.raise_runtime:
+                self.raise_runtime = False
+                raise RuntimeError("same thread")
             func()
 
         def action_enable_selected(self) -> None:

@@ -436,9 +436,12 @@ class MotorControlPanel(Static):
             return
         caller = getattr(app, "call_from_thread", None)
         if callable(caller):
-            caller(handler)
-        else:
-            handler()
+            try:
+                caller(handler)
+                return
+            except RuntimeError:
+                pass
+        handler()
 
 
 class MotorDetailPanel(Static):
