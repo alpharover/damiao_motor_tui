@@ -45,6 +45,10 @@ Welcome to the **dm-tui** project. This guide orients any agent working on the R
 - `B`: cycle between configured CAN buses
 - `E` / `D` / `Z`: enable, disable, or zero the highlighted motor
 - `V`: prompt for a velocity command (rad/s) for the highlighted motor
+- `A`: launch ID assignment wizard (writes ESC/MST IDs & CTRL_MODE, saves params)
+- `M`: edit metadata (friendly name, group tag, P/V/T limits)
+- `G`: manage motor groups (define ESC ID sets for orchestration)
+- `:`: open the command palette
 - `Ctrl+S`: persist configuration to disk
 
 ## Useful Utilities

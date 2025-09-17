@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from struct import pack
 from typing import Iterable
 
+from . import params
+
 ENABLE_FRAME = bytes([0xFF] * 7 + [0xFC])
 DISABLE_FRAME = bytes([0xFF] * 7 + [0xFD])
 ZERO_FRAME = bytes([0xFF] * 7 + [0xFE])
@@ -97,6 +99,22 @@ def build_filters(mst_ids: Iterable[int]) -> list[dict[str, int]]:
     return [{"can_id": mst_id, "can_mask": 0x7FF, "extended": 0} for mst_id in mst_ids]
 
 
+def frame_param_write(esc_id: int, rid: int, value: int) -> tuple[int, bytes]:
+    payload = bytearray(8)
+    payload[0] = params.MANAGEMENT_WRITE
+    payload[1] = esc_id & 0xFF
+    payload[2] = rid & 0xFF
+    payload[3:7] = (value & 0xFFFFFFFF).to_bytes(4, "little")
+    return 0x7FF, bytes(payload)
+
+
+def frame_param_save(esc_id: int) -> tuple[int, bytes]:
+    payload = bytearray(8)
+    payload[0] = params.MANAGEMENT_SAVE
+    payload[1] = esc_id & 0xFF
+    return 0x7FF, bytes(payload)
+
+
 def _to_signed(value: int, *, bits: int) -> int:
     sign_bit = 1 << (bits - 1)
     return (value ^ sign_bit) - sign_bit
@@ -112,4 +130,6 @@ __all__ = [
     "frame_position_speed",
     "decode_feedback",
     "build_filters",
+    "frame_param_write",
+    "frame_param_save",
 ]

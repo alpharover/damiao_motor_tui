@@ -27,8 +27,8 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 ### Milestone 3 – Discovery & Configuration UX (Week 3)
 - [x] Passive sniff logic recognizing motors by feedback signature.
 - [x] Gentle active probe (0 rad/s) workflow to locate quiet motors.
-- [ ] ID assignment wizard writing RIDs 7/8/10 safely, persisting via SAVE (0xAA).
-- [ ] Motor registry management (names, group tags, metadata) in persistence layer.
+- [x] ID assignment wizard writing RIDs 7/8/10 safely, persisting via SAVE (0xAA).
+- [x] Motor registry management (names, group tags, metadata) in persistence layer.
 
 ### Milestone 4 – Monitoring & Control Screens (Week 4)
 - [x] Textual screen for bus health (bitrate, error counters, txqueuelen guidance).

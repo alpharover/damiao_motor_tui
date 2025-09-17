@@ -13,23 +13,46 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.events import Mount
-from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static, TextLog
 
 from .bus_manager import BusManager, BusManagerError
-from .controllers import command_velocity, disable, disable_all, enable, zero
+from .controllers import (
+    assign_motor_ids,
+    command_velocity,
+    disable,
+    disable_all,
+    enable,
+    zero,
+)
 from .dmlib import protocol
 from .dmlib.protocol import Feedback
 from .discovery import MotorInfo, active_probe, passive_sniff
-from .persistence import AppConfig, MotorRecord, ensure_bus, load_config, save_config
+from .persistence import (
+    AppConfig,
+    GroupRecord,
+    MotorRecord,
+    ensure_bus,
+    load_config,
+    save_config,
+)
 from .osutils import read_bus_statistics
 
 DEFAULT_P_MAX = 12.0
 DEFAULT_V_MAX = 30.0
 DEFAULT_T_MAX = 20.0
+
+
+def _parse_optional_float(value: str) -> float | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 @dataclass(slots=True)
@@ -39,6 +62,28 @@ class TelemetryRecord:
     position_rad: float
     velocity_rad_s: float
     torque_nm: float
+
+
+@dataclass(slots=True)
+class IdAssignmentResult:
+    esc_id: int
+    mst_id: int
+    control_mode: int
+
+
+@dataclass(slots=True)
+class MetadataUpdate:
+    name: str | None
+    group: str | None
+    p_max: float | None
+    v_max: float | None
+    t_max: float | None
+
+
+@dataclass(slots=True)
+class GroupDefinition:
+    name: str
+    esc_ids: list[int]
 
 
 class BusStatusPanel(Static):
@@ -266,6 +311,28 @@ class TelemetryPanel(Static):
         self.update("\n".join(lines))
 
 
+class GroupPanel(Static):
+    """Display configured motor groups."""
+
+    DEFAULT_CSS = """
+    GroupPanel {
+        border: round $accent;
+        height: 8;
+        padding: 1 1;
+    }
+    """
+
+    def update_groups(self, groups: Dict[str, GroupRecord]) -> None:
+        if not groups:
+            self.update("No groups configured. Press G to add one.")
+            return
+        lines = ["[b]Groups[/b]"]
+        for name, record in sorted(groups.items()):
+            escs = ", ".join(f"0x{esc:02X}" for esc in record.esc_ids) or "(empty)"
+            lines.append(f"{name}: {escs}")
+        self.update("\n".join(lines))
+
+
 class VelocityModal(ModalScreen[Optional[float]]):
     """Modal dialog requesting a velocity setpoint."""
 
@@ -315,6 +382,168 @@ class VelocityModal(ModalScreen[Optional[float]]):
         self.on_button_pressed(Button.Pressed(apply_button))
 
 
+class IdWizardModal(ModalScreen[Optional[IdAssignmentResult]]):
+    """Collect new ESC/MST IDs and control mode."""
+
+    def __init__(self, current_esc: int, current_mst: int, default_mode: int = 3) -> None:
+        super().__init__()
+        self._current_esc = current_esc
+        self._current_mst = current_mst
+        self._default_mode = default_mode
+        self._esc_input: Input | None = None
+        self._mst_input: Input | None = None
+        self._mode_input: Input | None = None
+        self._error: Label | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "Assign new IDs. The wizard writes ESC_ID, MST_ID, CTRL_MODE and saves params.",
+            id="id-title",
+        )
+        self._esc_input = Input(str(self._current_esc), placeholder="New ESC ID (decimal)", id="id-esc")
+        yield Label("ESC ID", classes="form-label")
+        yield self._esc_input
+        default_mst = self._current_mst if self._current_mst else (self._current_esc + 0x10)
+        self._mst_input = Input(str(default_mst), placeholder="New MST ID (decimal)", id="id-mst")
+        yield Label("MST ID", classes="form-label")
+        yield self._mst_input
+        self._mode_input = Input(str(self._default_mode), placeholder="CTRL_MODE (e.g. 3 for velocity)", id="id-mode")
+        yield Label("Control Mode", classes="form-label")
+        yield self._mode_input
+        self._error = Label("", id="id-error")
+        yield self._error
+        with Horizontal(id="id-buttons"):
+            yield Button("Cancel", id="cancel")
+            yield Button("Apply", id="apply", variant="primary")
+
+    def on_mount(self, event: Mount) -> None:  # noqa: D401
+        if self._esc_input:
+            self.set_focus(self._esc_input)
+
+    def _read_int(self, inp: Input | None, label: str) -> Optional[int]:
+        if inp is None:
+            return None
+        value = inp.value.strip()
+        if not value:
+            return None
+        try:
+            base = 16 if value.lower().startswith("0x") else 10
+            return int(value, base)
+        except ValueError:
+            if self._error:
+                self._error.update(f"{label} must be numeric (decimal or 0x prefixed).")
+            return None
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        esc_id = self._read_int(self._esc_input, "ESC ID")
+        mst_id = self._read_int(self._mst_input, "MST ID")
+        mode = self._read_int(self._mode_input, "Control mode")
+        if esc_id is None or mst_id is None or mode is None:
+            return
+        if not (1 <= esc_id <= 0x7F and 1 <= mst_id <= 0x7FF):
+            if self._error:
+                self._error.update("ESC ID (1-127) and MST ID (1-2047) expected.")
+            return
+        self.dismiss(IdAssignmentResult(esc_id=esc_id, mst_id=mst_id, control_mode=mode))
+
+
+class MetadataModal(ModalScreen[Optional[MetadataUpdate]]):
+    """Capture friendly metadata for a motor."""
+
+    def __init__(self, esc_id: int, record: MotorRecord | None) -> None:
+        super().__init__()
+        self._esc_id = esc_id
+        self._name_input = Input(record.name or "" if record else "", placeholder="Display name")
+        self._group_input = Input(record.group or "" if record else "", placeholder="Group name")
+        metadata = record.metadata if record else {}
+        self._p_input = Input(str(metadata.get("p_max", "")), placeholder="P_MAX (rad)")
+        self._v_input = Input(str(metadata.get("v_max", "")), placeholder="V_MAX (rad/s)")
+        self._t_input = Input(str(metadata.get("t_max", "")), placeholder="T_MAX (Nm)")
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"Metadata for ESC 0x{self._esc_id:02X}", id="meta-title")
+        yield Label("Name")
+        yield self._name_input
+        yield Label("Group")
+        yield self._group_input
+        yield Label("P_MAX")
+        yield self._p_input
+        yield Label("V_MAX")
+        yield self._v_input
+        yield Label("T_MAX")
+        yield self._t_input
+        with Horizontal(id="meta-buttons"):
+            yield Button("Cancel", id="cancel")
+            yield Button("Save", id="save", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        update = MetadataUpdate(
+            name=self._name_input.value.strip() or None,
+            group=self._group_input.value.strip() or None,
+            p_max=_parse_optional_float(self._p_input.value),
+            v_max=_parse_optional_float(self._v_input.value),
+            t_max=_parse_optional_float(self._t_input.value),
+        )
+        self.dismiss(update)
+
+
+class GroupModal(ModalScreen[Optional[GroupDefinition]]):
+    """Create or edit a group definition."""
+
+    def __init__(self, existing: Dict[str, GroupRecord]) -> None:
+        super().__init__()
+        name_placeholder = "Group name"
+        self._name_input = Input(placeholder=name_placeholder, id="group-name")
+        self._esc_input = Input(placeholder="ESC IDs (comma or space separated)", id="group-escs")
+        self._error: Label | None = None
+        self._existing = existing
+
+    def compose(self) -> ComposeResult:
+        yield Static("Define a group for synchronized commands.", id="group-title")
+        yield Label("Group Name")
+        yield self._name_input
+        yield Label("ESC IDs")
+        yield self._esc_input
+        self._error = Label("", id="group-error")
+        yield self._error
+        with Horizontal(id="group-buttons"):
+            yield Button("Cancel", id="cancel")
+            yield Button("Save", id="save", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        name = self._name_input.value.strip()
+        if not name:
+            self._set_error("Name required.")
+            return
+        esc_field = self._esc_input.value.replace(",", " ")
+        esc_tokens = [tok for tok in esc_field.split() if tok]
+        esc_ids: list[int] = []
+        for tok in esc_tokens:
+            try:
+                base = 16 if tok.lower().startswith("0x") else 10
+                esc_ids.append(int(tok, base))
+            except ValueError:
+                self._set_error(f"Invalid ESC ID token: {tok}")
+                return
+        if name in self._existing and esc_ids == self._existing[name].esc_ids:
+            self.dismiss(None)
+            return
+        self.dismiss(GroupDefinition(name=name, esc_ids=esc_ids))
+
+    def _set_error(self, message: str) -> None:
+        if self._error:
+            self._error.update(f"[red]{message}[/red]")
+
+
 class DmTuiApp(App[None]):
     """dm-tui Textual application shell."""
 
@@ -347,6 +576,10 @@ class DmTuiApp(App[None]):
         Binding("d", "disable_selected", "Disable", show=True),
         Binding("z", "zero_selected", "Zero", show=True),
         Binding("v", "set_velocity", "Velocity", show=True),
+        Binding("a", "assign_ids", "Assign IDs", show=True),
+        Binding("m", "edit_metadata", "Edit Metadata", show=True),
+        Binding("g", "manage_groups", "Groups", show=True),
+        Binding(":", "open_command_palette", "Command Palette", show=False),
         Binding("ctrl+s", "save_config", "Save config", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
     ]
@@ -365,6 +598,10 @@ class DmTuiApp(App[None]):
         }
         self._motors: Dict[int, MotorInfo] = {}
         self._telemetry: Dict[int, TelemetryRecord] = {}
+        self._groups: Dict[str, GroupRecord] = {
+            group.name: GroupRecord(name=group.name, esc_ids=list(group.esc_ids))
+            for group in self._config.groups
+        }
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
@@ -382,6 +619,7 @@ class DmTuiApp(App[None]):
                 yield TelemetryPanel(id="telemetry-panel")
             with Vertical(id="right-column"):
                 yield MotorDetailPanel(id="motor-detail")
+                yield GroupPanel(id="group-panel")
                 yield ActivityLog(id="activity-log")
                 yield HintPanel(id="hint-panel")
         yield Footer()
@@ -391,6 +629,7 @@ class DmTuiApp(App[None]):
         self._refresh_hint_panel()
         self._refresh_motor_table()
         self._refresh_detail_panel()
+        self._refresh_group_panel()
         self._open_bus(self.active_bus)
         self._bus_stats_timer = self.set_interval(3.0, self._schedule_bus_stats_refresh)
         self._discovery_timer = self.set_interval(4.0, self._schedule_discovery)
@@ -490,9 +729,42 @@ class DmTuiApp(App[None]):
         modal = VelocityModal(esc_id, default)
         self.push_screen(modal, callback=lambda value: self._apply_velocity(esc_id, value))
 
+    def action_assign_ids(self) -> None:
+        esc_id = self._require_selected_motor()
+        if esc_id is None:
+            return
+        if not self._bus_manager:
+            self._log("[red]Cannot assign IDs; bus offline.[/red]")
+            return
+        info = self._motors.get(esc_id)
+        record = self._motor_records.get(esc_id)
+        current_mst = info.mst_id if info else (record.mst_id if record else esc_id + 0x10)
+        default_mode = 3
+        if record and record.metadata.get("ctrl_mode"):
+            try:
+                default_mode = int(record.metadata["ctrl_mode"])
+            except (TypeError, ValueError):
+                default_mode = 3
+        modal = IdWizardModal(esc_id, current_mst, default_mode)
+        self.push_screen(modal, callback=lambda result: self._apply_id_assignment(esc_id, result))
+
+    def action_edit_metadata(self) -> None:
+        esc_id = self._require_selected_motor()
+        if esc_id is None:
+            return
+        modal = MetadataModal(esc_id, self._motor_records.get(esc_id))
+        self.push_screen(modal, callback=lambda update: self._apply_metadata_update(esc_id, update))
+
+    def action_manage_groups(self) -> None:
+        modal = GroupModal(self._groups)
+        self.push_screen(modal, callback=self._apply_group_definition)
+
     def action_save_config(self) -> None:
         self._persist_config()
         self._log("Configuration saved.")
+
+    def action_open_command_palette(self) -> None:
+        super().action_command_palette()
 
     def _apply_velocity(self, esc_id: int, value: Optional[float]) -> None:
         if value is None:
@@ -506,6 +778,110 @@ class DmTuiApp(App[None]):
             self._log(f"[red]Velocity command failed:[/red] {exc}")
         else:
             self._log(f"Velocity {value:0.2f} rad/s sent to ESC 0x{esc_id:02X}.")
+
+    def _apply_id_assignment(self, current_esc: int, result: Optional[IdAssignmentResult]) -> None:
+        if result is None:
+            return
+        if not self._bus_manager:
+            self._log("[red]Cannot write IDs; bus offline.[/red]")
+            return
+        try:
+            assign_motor_ids(
+                self._bus_manager,
+                current_esc=current_esc,
+                new_esc=result.esc_id,
+                new_mst=result.mst_id,
+                control_mode=result.control_mode,
+            )
+        except BusManagerError as exc:  # pragma: no cover
+            self._log(f"[red]ID assignment failed:[/red] {exc}")
+            return
+        self._log(
+            f"Assigned ESC 0x{result.esc_id:02X}, MST 0x{result.mst_id:03X}, CTRL_MODE {result.control_mode}."
+        )
+        record = self._motor_records.pop(current_esc, None)
+        if record is None:
+            record = MotorRecord(esc_id=result.esc_id, mst_id=result.mst_id)
+        else:
+            record.esc_id = result.esc_id
+            record.mst_id = result.mst_id
+        record.metadata.setdefault("ctrl_mode", result.control_mode)
+        self._motor_records[result.esc_id] = record
+        info = self._motors.pop(current_esc, None)
+        if info:
+            self._motors[result.esc_id] = MotorInfo(
+                esc_id=result.esc_id,
+                mst_id=result.mst_id,
+                last_seen=monotonic(),
+            )
+        tele = self._telemetry.pop(current_esc, None)
+        if tele:
+            self._telemetry[result.esc_id] = tele
+        for group in self._groups.values():
+            group.esc_ids = [result.esc_id if esc == current_esc else esc for esc in group.esc_ids]
+        self._cleanup_empty_groups()
+        self.selected_esc = result.esc_id
+        self._refresh_motor_table()
+        self._refresh_telemetry_panel()
+        self._refresh_detail_panel()
+        self._refresh_group_panel()
+        self._reapply_filters()
+        self._persist_config()
+
+    def _apply_metadata_update(self, esc_id: int, update: Optional[MetadataUpdate]) -> None:
+        if update is None:
+            return
+        record = self._motor_records.get(esc_id)
+        if record is None:
+            mst_id = self._motors.get(esc_id).mst_id if esc_id in self._motors else esc_id + 0x10
+            record = MotorRecord(esc_id=esc_id, mst_id=mst_id)
+            self._motor_records[esc_id] = record
+        record.name = update.name
+        record.group = update.group
+        for key, value in (("p_max", update.p_max), ("v_max", update.v_max), ("t_max", update.t_max)):
+            if value is None:
+                record.metadata.pop(key, None)
+            else:
+                record.metadata[key] = value
+        # Update group membership
+        for group in self._groups.values():
+            if esc_id in group.esc_ids and group.name != (update.group or group.name):
+                group.esc_ids = [e for e in group.esc_ids if e != esc_id]
+        if update.group:
+            group = self._groups.setdefault(update.group, GroupRecord(name=update.group, esc_ids=[]))
+            if esc_id not in group.esc_ids:
+                group.esc_ids.append(esc_id)
+        self._cleanup_empty_groups()
+        self._refresh_group_panel()
+        self._refresh_detail_panel()
+        self._persist_config()
+        self._log(f"Updated metadata for ESC 0x{esc_id:02X}.")
+
+    def _apply_group_definition(self, definition: Optional[GroupDefinition]) -> None:
+        if definition is None:
+            return
+        unique_ids = sorted({esc for esc in definition.esc_ids if esc > 0})
+        self._groups[definition.name] = GroupRecord(name=definition.name, esc_ids=unique_ids)
+        self._cleanup_empty_groups()
+        self._refresh_group_panel()
+        self._persist_config()
+        self._log(f"Group '{definition.name}' updated ({len(unique_ids)} motors).")
+
+    def _reapply_filters(self) -> None:
+        if not self._bus_manager:
+            return
+        mst_ids = [record.mst_id for record in self._motor_records.values() if record.mst_id]
+        if not mst_ids:
+            return
+        try:
+            self._bus_manager.set_filters(protocol.build_filters(mst_ids))
+        except BusManagerError as exc:  # pragma: no cover
+            self._log(f"[yellow]Warning:[/yellow] failed to apply filters: {exc}")
+
+    def _cleanup_empty_groups(self) -> None:
+        empty = [name for name, group in self._groups.items() if not group.esc_ids]
+        for name in empty:
+            del self._groups[name]
 
     def _require_selected_motor(self) -> Optional[int]:
         if self.selected_esc is None:
@@ -581,6 +957,7 @@ class DmTuiApp(App[None]):
                 record.mst_id = motor.mst_id
                 config_changed = True
         self._refresh_motor_table()
+        self._reapply_filters()
         if config_changed:
             self._persist_config()
 
@@ -615,6 +992,7 @@ class DmTuiApp(App[None]):
         self._refresh_motor_table()
         self._refresh_telemetry_panel()
         self._refresh_detail_panel()
+        self._reapply_filters()
         if config_changed:
             self._persist_config()
 
@@ -659,6 +1037,10 @@ class DmTuiApp(App[None]):
         panel = self.query_one(HintPanel)
         panel.update_hints(self.active_bus, self.selected_esc)
 
+    def _refresh_group_panel(self) -> None:
+        panel = self.query_one(GroupPanel)
+        panel.update_groups(self._groups)
+
     def _open_bus(self, channel: str) -> None:
         self._close_bus()
         try:
@@ -672,12 +1054,7 @@ class DmTuiApp(App[None]):
         self._bus_manager = manager
         self._telemetry.clear()
         manager.register_listener(self._handle_bus_message)
-        mst_ids = [record.mst_id for record in self._motor_records.values() if record.mst_id]
-        if mst_ids:
-            try:
-                manager.set_filters(protocol.build_filters(mst_ids))
-            except BusManagerError as exc:  # pragma: no cover
-                self._log(f"[yellow]Warning:[/yellow] failed to apply filters: {exc}")
+        self._reapply_filters()
         self._log(f"Connected to {channel}.")
         self._update_bus_stats({"state": "Initializing"})
 
@@ -693,6 +1070,11 @@ class DmTuiApp(App[None]):
     def _persist_config(self) -> None:
         self._config.motors = list(self._motor_records.values())
         self._config.active_bus = self.active_bus
+        self._cleanup_empty_groups()
+        self._config.groups = [
+            GroupRecord(name=name, esc_ids=sorted(set(record.esc_ids)))
+            for name, record in self._groups.items()
+        ]
         save_config(self._config, self._config_path)
 
     def _log(self, message: str) -> None:

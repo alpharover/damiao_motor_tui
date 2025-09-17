@@ -12,6 +12,7 @@ Textual-powered terminal UI for discovering, configuring, and commanding Damiao 
 - Demo choreographies (sine orchestra, duet handshake, figure-8) built on python-can Broadcast Manager.
 - CSV telemetry logging and optional `candump` capture for deep analysis.
 - Headless Textual UI with live bus diagnostics, discovery triggers, and keyboard E-STOP for quick triage.
+- ID assignment wizard writes ESC/MST IDs + CTRL_MODE via 0x7FF management frames, with metadata editor and group management built in.
 - Motor detail pane with enable/disable/zero shortcuts, velocity prompt, and live telemetry summaries.
 
 ## Architecture Overview
@@ -63,7 +64,7 @@ sudo ifconfig canB txqueuelen 65536
 3. Use passive discovery first. If no motors appear, start an active probe (safe 0 rad/s cycle).
 4. Configure IDs via the wizard (writes RIDs 7/8/10, saves with 0xAA) before issuing motion commands.
 5. Leverage global E-STOP (`Space`) before editing demo scripts or periodic tasks.
-6. Cycle CAN buses with `B`, trigger discovery with `R` (safe active probe fallback), use `E/D/Z` to enable/disable/zero the highlighted motor, `V` to push a velocity command, and persist config updates via `Ctrl+S`.
+6. Cycle CAN buses with `B`, trigger discovery with `R` (safe active probe fallback), use `E/D/Z` to enable/disable/zero the highlighted motor, `V` for velocity prompts, `A` to run the ID assignment wizard, `M` to edit metadata (name, limits, group), `G` to manage groups, and persist config updates via `Ctrl+S`.
 
 ### Testing Strategy
 - Unit tests on protocol packers, MIT bit packing, and feedback decoding using `vcan`.

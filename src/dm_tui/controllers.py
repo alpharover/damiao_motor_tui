@@ -7,6 +7,7 @@ from typing import Iterable, Sequence
 
 from .bus_manager import BusManager
 from .dmlib import protocol
+from .dmlib.params import RID_CTRL_MODE, RID_ESC_ID, RID_MST_ID
 
 
 @dataclass(slots=True)
@@ -48,3 +49,28 @@ def command_velocities(bus: BusManager, targets: Iterable[MotorTarget]) -> None:
 
 def command_velocity(bus: BusManager, esc_id: int, velocity_rad_s: float) -> None:
     command_velocities(bus, [MotorTarget(esc_id=esc_id, velocity_rad_s=velocity_rad_s)])
+
+
+def write_param(bus: BusManager, esc_id: int, rid: int, value: int) -> None:
+    arb_id, data = protocol.frame_param_write(esc_id, rid, value)
+    bus.send(arb_id, data)
+
+
+def save_params(bus: BusManager, esc_id: int) -> None:
+    arb_id, data = protocol.frame_param_save(esc_id)
+    bus.send(arb_id, data)
+
+
+def assign_motor_ids(
+    bus: BusManager,
+    *,
+    current_esc: int,
+    new_esc: int,
+    new_mst: int,
+    control_mode: int,
+) -> None:
+    disable(bus, current_esc)
+    write_param(bus, current_esc, RID_ESC_ID, new_esc)
+    write_param(bus, current_esc, RID_MST_ID, new_mst)
+    write_param(bus, current_esc, RID_CTRL_MODE, control_mode)
+    save_params(bus, current_esc)

@@ -33,12 +33,21 @@ class MotorRecord:
 
 
 @dataclass(slots=True)
+class GroupRecord:
+    """Named group of ESC IDs for synchronized commands."""
+
+    name: str
+    esc_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class AppConfig:
     """Top-level configuration persisted between dm-tui sessions."""
 
     buses: list[BusConfig] = field(default_factory=lambda: [BusConfig(channel="canB")])
     motors: list[MotorRecord] = field(default_factory=list)
     active_bus: str = "canB"
+    groups: list[GroupRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the config to primitive types for YAML dumping."""
@@ -46,16 +55,18 @@ class AppConfig:
             "buses": [asdict(bus) for bus in self.buses],
             "motors": [asdict(motor) for motor in self.motors],
             "active_bus": self.active_bus,
+            "groups": [asdict(group) for group in self.groups],
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
         buses = [BusConfig(**bus) for bus in data.get("buses", [])]
         motors = [MotorRecord(**motor) for motor in data.get("motors", [])]
+        groups = [GroupRecord(**group) for group in data.get("groups", [])]
         if not buses:
             buses = [BusConfig(channel="canB")]
         active_bus = data.get("active_bus") or buses[0].channel
-        return cls(buses=buses, motors=motors, active_bus=active_bus)
+        return cls(buses=buses, motors=motors, active_bus=active_bus, groups=groups)
 
 
 def load_config(path: Path | None = None) -> AppConfig:
