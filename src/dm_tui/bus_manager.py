@@ -113,12 +113,16 @@ class BusManager:
         if self._bus is not None:
             return
         LOGGER.info("Opening CAN bus: channel=%s interface=%s", self._channel, self._interface)
-        self._bus = can.ThreadSafeBus(  # type: ignore[attr-defined]
-            channel=self._channel,
-            interface=self._interface,
-            bitrate=self._bitrate,
-            receive_own_messages=self._receive_own_messages,
-        )
+        try:
+            self._bus = can.ThreadSafeBus(  # type: ignore[attr-defined]
+                channel=self._channel,
+                interface=self._interface,
+                bitrate=self._bitrate,
+                receive_own_messages=self._receive_own_messages,
+            )
+        except Exception as exc:  # pragma: no cover - hardware dependent
+            self._bus = None
+            raise BusManagerError(f"Failed to open bus '{self._channel}': {exc}") from exc
         self._notifier = can.Notifier(self._bus, [self._reader, self._callback_listener], 0.5)
 
     def close(self) -> None:

@@ -38,12 +38,14 @@ class AppConfig:
 
     buses: list[BusConfig] = field(default_factory=lambda: [BusConfig(channel="canB")])
     motors: list[MotorRecord] = field(default_factory=list)
+    active_bus: str = "canB"
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the config to primitive types for YAML dumping."""
         return {
             "buses": [asdict(bus) for bus in self.buses],
             "motors": [asdict(motor) for motor in self.motors],
+            "active_bus": self.active_bus,
         }
 
     @classmethod
@@ -52,7 +54,8 @@ class AppConfig:
         motors = [MotorRecord(**motor) for motor in data.get("motors", [])]
         if not buses:
             buses = [BusConfig(channel="canB")]
-        return cls(buses=buses, motors=motors)
+        active_bus = data.get("active_bus") or buses[0].channel
+        return cls(buses=buses, motors=motors, active_bus=active_bus)
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -76,10 +79,19 @@ def save_config(config: AppConfig, path: Path | None = None) -> None:
         yaml.safe_dump(config.to_dict(), handle, sort_keys=False)
 
 
-def ensure_bus(config: AppConfig, channel: str, bitrate: int = 1_000_000) -> AppConfig:
+def ensure_bus(
+    config: AppConfig,
+    channel: str,
+    bitrate: int = 1_000_000,
+    *,
+    make_active: bool = False,
+) -> AppConfig:
     """Return a config with *channel* present, adding it if necessary."""
+
     if channel not in {bus.channel for bus in config.buses}:
         config.buses.append(BusConfig(channel=channel, bitrate=bitrate))
+    if make_active:
+        config.active_bus = channel
     return config
 
 
