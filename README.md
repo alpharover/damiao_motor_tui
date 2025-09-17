@@ -90,6 +90,13 @@ After completing the software checks in [`docs/TESTING.md`](docs/TESTING.md), ru
 - Always set `CTRL_MODE=3` before issuing velocity commands.
 - Watch for SocketCAN “No buffer space available” errors—usually indicates no ACK or queue saturation.
 - Use the built-in bus health screen to monitor error counters and interface state.
+- A watchdog monitors telemetry age and automatically issues `disable` to any ESC whose feedback stops for more than a few
+  seconds. Watchdog events are called out in the motor table, detail pane, and activity log so operators can spot the
+  intervention immediately.
+- Tune watchdog behaviour via environment variables before launching the TUI:
+  - `DM_TUI_WATCHDOG_THRESHOLD` (seconds of inactivity before a motor is flagged, default `3.0`).
+  - `DM_TUI_WATCHDOG_COOLDOWN` (minimum seconds between repeated disable commands per ESC, default `5.0`).
+  - `DM_TUI_WATCHDOG_INTERVAL` (poll period for the watchdog scan, default `1.0`).
 
 ## Roadmap Snapshot
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for detailed milestones (environment setup, protocol core, discovery UX, monitoring/control screens, demo polish, release prep).
