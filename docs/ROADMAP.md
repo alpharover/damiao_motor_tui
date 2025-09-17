@@ -41,7 +41,7 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 - [ ] Implement sine orchestra, handshake duet, and figure-8 demos via `send_periodic` handles.
 - [ ] Provide demo control overlay with start/stop, amplitude/frequency tweaks, and E-STOP integration.
 - [ ] Add CSV telemetry logging and optional `candump` capture integration.
-- [ ] Document procedures for hardware validation (±30/40 rpm sweeps, braking, MIT taste test).
+- [x] Document procedures for hardware validation (±30/40 rpm sweeps, braking, MIT taste test). See [`Hardware Validation Guide`](HARDWARE_VALIDATION.md).
 
 ### Milestone 6 – Polish & Release (Week 6)
 - [ ] Harden error handling (`No buffer space`, ERR nibble decoding, bus state changes).
