@@ -208,7 +208,7 @@ class MotorTable(DataTable):
                 delta = max(0.0, now - info.last_seen)
                 last_seen = f"{delta:0.1f}s ago"
                 status = "Active" if delta < 2.0 else "Quiet"
-            name = record.name or "--" if record else "--"
+            name = record.name if record and record.name else "--"
             row_key = str(esc_id)
             self.add_row(
                 f"0x{esc_id:02X}",
