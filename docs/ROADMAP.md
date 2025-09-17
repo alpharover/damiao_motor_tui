@@ -19,9 +19,9 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 - [x] Validate SocketCAN interactions using `vcan` loopback tests.
 
 ### Milestone 2 – Protocol & Safety Core (Week 2)
-- [ ] Implement frame pack/unpack utilities for enable/disable/zero, speed, position-speed, and MIT.
-- [ ] Decode feedback frames into engineering units leveraging RID-configured limits.
-- [ ] Implement RID read/write/save helpers for ID assignment and mode control.
+- [x] Implement frame pack/unpack utilities for enable/disable/zero, speed, position-speed, and MIT.
+- [x] Decode feedback frames into engineering units leveraging RID-configured limits.
+- [x] Implement RID read/write/save helpers for ID assignment and mode control.
 - [x] Integrate global E-STOP and watchdog (highlight stale feedback, auto-disable if needed).
 
 ### Milestone 3 – Discovery & Configuration UX (Week 3)

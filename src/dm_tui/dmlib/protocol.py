@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite
-from struct import pack
+from struct import pack, unpack
 from typing import Iterable
 
 from . import params
@@ -12,6 +12,7 @@ from . import params
 ENABLE_FRAME = bytes([0xFF] * 7 + [0xFC])
 DISABLE_FRAME = bytes([0xFF] * 7 + [0xFD])
 ZERO_FRAME = bytes([0xFF] * 7 + [0xFE])
+MANAGEMENT_ARBITRATION_ID = 0x7FF
 
 MIT_DEFAULT_POSITION_LIMIT = 12.0
 MIT_DEFAULT_VELOCITY_LIMIT = 30.0
@@ -55,6 +56,16 @@ class FeedbackEngineering:
     torque_nm: float
     temp_mos_c: float
     temp_rotor_c: float
+
+
+@dataclass(slots=True)
+class ManagementResponse:
+    """Parsed management response payload from the 0x7FF channel."""
+
+    esc_id: int
+    command: int
+    rid: int
+    value: int
 
 
 def frame_enable(esc_id: int) -> tuple[int, bytes]:
@@ -106,6 +117,41 @@ def frame_mit(
         kd_limit=kd_limit,
     )
     return 0x300 + esc_id, payload
+
+
+def is_enable_payload(payload: bytes) -> bool:
+    return payload == ENABLE_FRAME
+
+
+def is_disable_payload(payload: bytes) -> bool:
+    return payload == DISABLE_FRAME
+
+
+def is_zero_payload(payload: bytes) -> bool:
+    return payload == ZERO_FRAME
+
+
+def unpack_speed_payload(payload: bytes) -> float:
+    if len(payload) != 8:
+        raise ValueError("Speed command payload must be 8 bytes")
+    return unpack("<f", payload[:4])[0]
+
+
+def unpack_position_speed_payload(payload: bytes) -> tuple[float, float]:
+    if len(payload) != 8:
+        raise ValueError("Position-speed payload must be 8 bytes")
+    position, velocity = unpack("<ff", payload)
+    return position, velocity
+
+
+def _build_management_payload(esc_id: int, command: int, rid: int = 0, value: int = 0) -> bytes:
+    payload = bytearray(8)
+    payload[0] = esc_id & 0xFF
+    payload[1] = (esc_id >> 8) & 0xFF
+    payload[2] = command & 0xFF
+    payload[3] = rid & 0xFF
+    payload[4:8] = (value & 0xFFFFFFFF).to_bytes(4, "little")
+    return bytes(payload)
 
 
 def pack_mit_payload(
@@ -204,20 +250,34 @@ def build_filters(mst_ids: Iterable[int]) -> list[dict[str, int]]:
     return [{"can_id": mst_id, "can_mask": 0x7FF, "extended": 0} for mst_id in mst_ids]
 
 
+def frame_param_read(esc_id: int, rid: int) -> tuple[int, bytes]:
+    payload = _build_management_payload(esc_id, params.MANAGEMENT_READ, rid)
+    return MANAGEMENT_ARBITRATION_ID, payload
+
+
 def frame_param_write(esc_id: int, rid: int, value: int) -> tuple[int, bytes]:
-    payload = bytearray(8)
-    payload[0] = params.MANAGEMENT_WRITE
-    payload[1] = esc_id & 0xFF
-    payload[2] = rid & 0xFF
-    payload[3:7] = (value & 0xFFFFFFFF).to_bytes(4, "little")
-    return 0x7FF, bytes(payload)
+    payload = _build_management_payload(esc_id, params.MANAGEMENT_WRITE, rid, value)
+    return MANAGEMENT_ARBITRATION_ID, payload
 
 
 def frame_param_save(esc_id: int) -> tuple[int, bytes]:
-    payload = bytearray(8)
-    payload[0] = params.MANAGEMENT_SAVE
-    payload[1] = esc_id & 0xFF
-    return 0x7FF, bytes(payload)
+    payload = _build_management_payload(esc_id, params.MANAGEMENT_SAVE)
+    return MANAGEMENT_ARBITRATION_ID, payload
+
+
+def frame_param_refresh(esc_id: int) -> tuple[int, bytes]:
+    payload = _build_management_payload(esc_id, params.MANAGEMENT_REFRESH)
+    return MANAGEMENT_ARBITRATION_ID, payload
+
+
+def parse_management_response(data: bytes) -> ManagementResponse:
+    if len(data) != 8:
+        raise ValueError("Management response must be 8 bytes")
+    esc_id = data[0] | (data[1] << 8)
+    command = data[2]
+    rid = data[3]
+    value = int.from_bytes(data[4:8], "little")
+    return ManagementResponse(esc_id=esc_id, command=command, rid=rid, value=value)
 
 
 def _to_signed(value: int, *, bits: int) -> int:
@@ -249,18 +309,28 @@ def _uint_to_float(value: int, minimum: float, maximum: float, *, bits: int) -> 
 __all__ = [
     "Feedback",
     "FeedbackEngineering",
+    "ManagementResponse",
     "frame_enable",
     "frame_disable",
     "frame_zero",
     "frame_speed",
     "frame_position_speed",
     "frame_mit",
+    "is_enable_payload",
+    "is_disable_payload",
+    "is_zero_payload",
+    "unpack_speed_payload",
+    "unpack_position_speed_payload",
     "pack_mit_payload",
     "decode_mit",
     "decode_feedback",
     "build_filters",
+    "frame_param_read",
     "frame_param_write",
     "frame_param_save",
+    "frame_param_refresh",
+    "parse_management_response",
+    "MANAGEMENT_ARBITRATION_ID",
     "MIT_DEFAULT_POSITION_LIMIT",
     "MIT_DEFAULT_VELOCITY_LIMIT",
     "MIT_DEFAULT_TORQUE_LIMIT",

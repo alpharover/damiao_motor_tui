@@ -1,10 +1,14 @@
 from time import monotonic
 
+import pytest
 from rich.console import Console
 from textual.message_pump import active_app
 
-from dm_tui.app import DmTuiApp, MitCommand, MitModal, MotorTable
+from dm_tui.app import DmTuiApp, MitCommand, MitModal, MotorControlPanel, MotorTable
 from dm_tui.discovery import MotorInfo
+from dm_tui.dmlib import params
+from dm_tui.dmlib.protocol import Feedback
+from textual.widgets import Button
 
 
 class _DummyApp:
@@ -71,6 +75,97 @@ def test_mit_modal_parses_user_values() -> None:
     assert result.kp == 50.0
     assert result.kd == 2.5
 
+
+def test_ingest_feedback_fetches_rid_limits(monkeypatch, tmp_path) -> None:
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    app._bus_manager = object()
+    app._ensure_telemetry_log = lambda: None
+
+    refreshed: list[int] = []
+
+    def fake_refresh(_bus, esc_id: int) -> None:
+        refreshed.append(esc_id)
+
+    values = {
+        params.RID_P_MAX: 4.5,
+        params.RID_V_MAX: 7.0,
+        params.RID_T_MAX: 3.5,
+    }
+    read_calls: list[tuple[int, int]] = []
+
+    def fake_read(_bus, esc_id: int, rid: int, timeout: float = 0.3) -> float:
+        read_calls.append((esc_id, rid))
+        return values[rid]
+
+    monkeypatch.setattr("dm_tui.app.refresh_params", fake_refresh)
+    monkeypatch.setattr("dm_tui.app.read_param_float", fake_read)
+
+    feedback = Feedback(
+        esc_id=0x01,
+        status=0,
+        position_raw=32767,
+        velocity_raw=2047,
+        torque_raw=2047,
+        temp_mos=30,
+        temp_rotor=32,
+    )
+
+    app._ingest_feedback(0x01, feedback, mst_id=0x101, timestamp=monotonic())
+
+    record = app._motor_records[0x01]
+    assert record.metadata["p_max"] == 4.5
+    assert record.metadata["v_max"] == 7.0
+    assert record.metadata["t_max"] == 3.5
+    assert 0x01 in app._limits_loaded
+    assert refreshed == [0x01]
+    assert read_calls == [
+        (0x01, params.RID_P_MAX),
+        (0x01, params.RID_V_MAX),
+        (0x01, params.RID_T_MAX),
+    ]
+    telemetry = app._telemetry[0x01]
+    assert telemetry.position_rad == pytest.approx(4.5, rel=1e-3)
+    assert telemetry.velocity_rad_s == pytest.approx(7.0, rel=1e-3)
+    assert telemetry.torque_nm == pytest.approx(3.5, rel=1e-3)
+
+
+def test_motor_control_panel_updates_and_disables() -> None:
+    panel = MotorControlPanel()
+    panel.update_controls(None, bus_online=False)
+    assert all(button.disabled for button in panel._buttons.values())
+
+    panel.update_controls(0x02, bus_online=True)
+    assert not panel._buttons["control-enable"].disabled
+
+
+def test_motor_control_panel_button_invokes_action() -> None:
+    panel = MotorControlPanel()
+
+    class _StubApp:
+        def __init__(self) -> None:
+            self.called: list[str] = []
+            self.console = Console()
+
+        def call_from_thread(self, func):
+            func()
+
+        def action_enable_selected(self) -> None:
+            self.called.append("enable")
+
+    stub = _StubApp()
+    token = active_app.set(stub)
+    try:
+        panel._app = stub  # type: ignore[attr-defined]
+        panel.update_controls(0x01, bus_online=True)
+
+        event = Button.Pressed(panel._buttons["control-enable"])
+        panel.on_button_pressed(event)
+    finally:
+        active_app.reset(token)
+
+    assert stub.called == ["enable"]
+
+
 def test_watchdog_disables_stale_motor(monkeypatch, tmp_path) -> None:
     """Watchdog should disable stale motors and annotate state."""
 
@@ -122,3 +217,12 @@ def test_watchdog_respects_cooldown(monkeypatch, tmp_path) -> None:
 
     assert calls == []
     assert 0x02 in app._watchdog_tripped
+
+
+def test_get_commands_includes_motor_controls(tmp_path) -> None:
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    prompts = [command.prompt for command in app.get_commands()]
+    assert "Enable Selected" in prompts
+    assert "Disable Selected" in prompts
+    assert "Zero Selected" in prompts
+    assert "Set Velocity" in prompts

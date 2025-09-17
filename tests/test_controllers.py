@@ -1,3 +1,8 @@
+import pytest
+
+from types import SimpleNamespace
+
+from dm_tui.bus_manager import BusManagerError
 from dm_tui.controllers import (
     MitTarget,
     assign_motor_ids,
@@ -6,17 +11,26 @@ from dm_tui.controllers import (
     command_velocity,
     disable,
     enable,
+    read_param,
+    refresh_params,
     write_param,
     zero,
 )
+from dm_tui.dmlib import params, protocol
 
 
 class FakeBus:
-    def __init__(self):
+    def __init__(self, messages=None):
         self.sent = []
+        self._messages = list(messages or [])
 
     def send(self, arb_id, data, **kwargs):
         self.sent.append((arb_id, data))
+
+    def get_message(self, timeout=None):
+        if self._messages:
+            return self._messages.pop(0)
+        return None
 
 
 def test_enable_disable_zero_commands_build_expected_frames():
@@ -77,10 +91,36 @@ def test_write_param_targets_management_id():
     bus = FakeBus()
     write_param(bus, 1, 0x08, 0x02)
     arb_id, data = bus.sent[0]
-    assert arb_id == 0x7FF
-    assert data[0] == 0x55
-    assert data[1] == 0x01
-    assert data[2] == 0x08
+    assert arb_id == protocol.MANAGEMENT_ARBITRATION_ID
+    assert data[0] == 0x01
+    assert data[1] == 0x00
+    assert data[2] == params.MANAGEMENT_WRITE
+    assert data[3] == 0x08
+
+
+def test_read_param_returns_register_value():
+    response = bytes([0x11, 0x00, params.MANAGEMENT_READ, 0x07, 0x34, 0x12, 0x00, 0x00])
+    messages = [
+        SimpleNamespace(arbitration_id=0x200, data=b"\x00" * 8),
+        SimpleNamespace(arbitration_id=protocol.MANAGEMENT_ARBITRATION_ID, data=response),
+    ]
+    bus = FakeBus(messages)
+    value = read_param(bus, 0x11, 0x07, timeout=0.1)
+    assert value == 0x1234
+
+
+def test_read_param_timeout_raises_bus_manager_error():
+    bus = FakeBus([])
+    with pytest.raises(BusManagerError):
+        read_param(bus, 0x11, 0x07, timeout=0.05)
+
+
+def test_refresh_params_targets_management_channel():
+    bus = FakeBus()
+    refresh_params(bus, 0x05)
+    arb_id, data = bus.sent[0]
+    assert arb_id == protocol.MANAGEMENT_ARBITRATION_ID
+    assert data[2] == params.MANAGEMENT_REFRESH
 
 
 def test_assign_motor_ids_sequences_commands():

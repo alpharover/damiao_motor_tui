@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import TYPE_CHECKING, Deque, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Deque, Dict, Iterable, Mapping, Optional
 
 from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
@@ -33,9 +33,11 @@ from .controllers import (
     disable,
     disable_all,
     enable,
+    read_param_float,
+    refresh_params,
     zero,
 )
-from .dmlib import protocol
+from .dmlib import params, protocol
 from .dmlib.protocol import Feedback
 from .discovery import MotorInfo, active_probe, passive_sniff
 from .demos import DemoHandle, brake_to_zero, sine_orchestra
@@ -59,6 +61,8 @@ DEFAULT_T_MAX = 20.0
 DEFAULT_KP_MAX = protocol.MIT_DEFAULT_KP_LIMIT
 DEFAULT_KD_MAX = protocol.MIT_DEFAULT_KD_LIMIT
 
+LIMIT_METADATA_KEYS = ("p_max", "v_max", "t_max")
+
 
 def _parse_env_float(name: str, default: float) -> float:
     """Return a float from *name* env var, falling back to *default* on errors."""
@@ -70,6 +74,20 @@ def _parse_env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _has_limit_metadata(metadata: Mapping[str, object]) -> bool:
+    return all(key in metadata or key.upper() in metadata for key in LIMIT_METADATA_KEYS)
+
+
+def _coerce_positive(value: object, default: float) -> float:
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(candidate) or candidate <= 0:
+        return default
+    return candidate
 
 
 WATCHDOG_THRESHOLD_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_THRESHOLD", 3.0)
@@ -340,6 +358,83 @@ class HintPanel(Static):
                 ]
             )
         )
+
+
+class MotorControlPanel(Static):
+    """Button panel exposing per-motor controls."""
+
+    DEFAULT_CSS = """
+    MotorControlPanel {
+        border: round $accent;
+        height: 8;
+        padding: 1 1;
+    }
+
+    #motor-control-buttons {
+        height: auto;
+        padding-top: 1;
+        column-gap: 1;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._info = Static("Select a motor to enable controls.", id="motor-control-info")
+        specs = [
+            ("control-enable", "Enable", "action_enable_selected"),
+            ("control-disable", "Disable", "action_disable_selected"),
+            ("control-zero", "Zero", "action_zero_selected"),
+            ("control-velocity", "Velocity…", "action_set_velocity"),
+            ("control-mit", "MIT…", "action_set_mit"),
+        ]
+        buttons = []
+        self._buttons: dict[str, Button] = {}
+        self._action_lookup: dict[str, str] = {}
+        for button_id, label, action in specs:
+            button = Button(label, id=button_id)
+            button.disabled = True
+            self._buttons[button_id] = button
+            self._action_lookup[button_id] = action
+            buttons.append(button)
+        self._buttons_row = Horizontal(*buttons, id="motor-control-buttons")
+        self._current_esc: int | None = None
+
+    def compose(self) -> ComposeResult:
+        yield self._info
+        yield self._buttons_row
+
+    def update_controls(self, esc_id: int | None, *, bus_online: bool) -> None:
+        self._current_esc = esc_id
+        if esc_id is None:
+            self._info.update("Select a motor to enable controls.")
+        else:
+            status = "online" if bus_online else "offline"
+            self._info.update(f"ESC 0x{esc_id:02X} ({status})")
+        disabled = esc_id is None or not bus_online
+        for button in self._buttons.values():
+            try:
+                button.disabled = disabled
+            except Exception:  # fallback for tests when widget not attached
+                button._disabled = disabled  # type: ignore[attr-defined]
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        action = self._action_lookup.get(event.button.id)
+        if action is None:
+            return
+        self._dispatch_action(action)
+
+    def _dispatch_action(self, action: str) -> None:
+        app = getattr(self, "app", None)
+        if app is None:
+            return
+        handler = getattr(app, action, None)
+        if handler is None:
+            return
+        caller = getattr(app, "call_from_thread", None)
+        if callable(caller):
+            caller(handler)
+        else:
+            handler()
 
 
 class MotorDetailPanel(Static):
@@ -1037,6 +1132,12 @@ class DmTuiApp(App[None]):
         self._watchdog_interval = max(WATCHDOG_INTERVAL_SECONDS, 0.2)
         self._watchdog_last_disable: Dict[int, float] = {}
         self._watchdog_tripped: set[int] = set()
+        self._limits_loaded: set[int] = {
+            esc_id
+            for esc_id, record in self._motor_records.items()
+            if _has_limit_metadata(record.metadata)
+        }
+        self._limit_errors: set[int] = set()
         self.active_bus = self._config.active_bus
 
     def compose(self) -> ComposeResult:
@@ -1049,6 +1150,7 @@ class DmTuiApp(App[None]):
                 yield VelocitySparkline(id="velocity-history")
             with Vertical(id="right-column"):
                 yield MotorDetailPanel(id="motor-detail")
+                yield MotorControlPanel(id="motor-control")
                 yield GroupPanel(id="group-panel")
                 yield ActivityLog(id="activity-log")
                 yield HintPanel(id="hint-panel")
@@ -1060,6 +1162,7 @@ class DmTuiApp(App[None]):
         self._refresh_motor_table()
         self._refresh_detail_panel()
         self._refresh_group_panel()
+        self._refresh_control_panel()
         self._open_bus(self.active_bus)
         self._bus_stats_timer = self.set_interval(3.0, self._schedule_bus_stats_refresh)
         self._discovery_timer = self.set_interval(4.0, self._schedule_discovery)
@@ -1084,12 +1187,14 @@ class DmTuiApp(App[None]):
         self._refresh_hint_panel()
         self._open_bus(active_bus)
         self._schedule_bus_stats_refresh()
+        self._refresh_control_panel()
 
     def watch_selected_esc(self, selected_esc: Optional[int]) -> None:
         if not self._mounted:
             return
         self._refresh_hint_panel()
         self._refresh_detail_panel()
+        self._refresh_control_panel()
 
     # --- Actions -----------------------------------------------------------
 
@@ -1660,6 +1765,21 @@ class DmTuiApp(App[None]):
             self._persist_config()
 
     def _ingest_feedback(self, esc_id: int, feedback: Feedback, mst_id: int, timestamp: float) -> None:
+        record = self._motor_records.get(esc_id)
+        config_changed = False
+        if record is None:
+            record = MotorRecord(esc_id=esc_id, mst_id=mst_id)
+            self._motor_records[esc_id] = record
+            self._config.motors.append(record)
+            config_changed = True
+            self._log(f"Telemetry discovered ESC 0x{esc_id:02X} (MST 0x{mst_id:03X}).")
+        elif record.mst_id != mst_id:
+            record.mst_id = mst_id
+            config_changed = True
+
+        if self._maybe_update_limits(record):
+            config_changed = True
+
         limits = self._resolve_limits(esc_id)
         engineering = feedback.to_engineering(
             p_max=limits[0],
@@ -1698,17 +1818,6 @@ class DmTuiApp(App[None]):
         temp_history = self._temp_history.setdefault(esc_id, deque(maxlen=200))
         temp_history.append(feedback.temp_mos)
         self._motors[esc_id] = MotorInfo(esc_id=esc_id, mst_id=mst_id, last_seen=timestamp)
-        record = self._motor_records.get(esc_id)
-        config_changed = False
-        if record is None:
-            record = MotorRecord(esc_id=esc_id, mst_id=mst_id)
-            self._motor_records[esc_id] = record
-            self._config.motors.append(record)
-            config_changed = True
-            self._log(f"Telemetry discovered ESC 0x{esc_id:02X} (MST 0x{mst_id:03X}).")
-        elif record.mst_id != mst_id:
-            record.mst_id = mst_id
-            config_changed = True
         if self.selected_esc is None:
             self.selected_esc = esc_id
         if self._mounted:
@@ -1752,6 +1861,7 @@ class DmTuiApp(App[None]):
         if esc_id is None:
             panel.show_idle()
             self._refresh_velocity_sparkline()
+            self._refresh_control_panel()
             return
         panel.show_details(
             esc_id=esc_id,
@@ -1763,6 +1873,7 @@ class DmTuiApp(App[None]):
             watchdog_last=self._watchdog_last_disable.get(esc_id),
         )
         self._refresh_velocity_sparkline()
+        self._refresh_control_panel()
 
     def _refresh_telemetry_panel(self) -> None:
         panel = self.query_one(TelemetryPanel)
@@ -1781,6 +1892,15 @@ class DmTuiApp(App[None]):
     def _refresh_hint_panel(self) -> None:
         panel = self.query_one(HintPanel)
         panel.update_hints(self.active_bus, self.selected_esc)
+
+    def _refresh_control_panel(self) -> None:
+        if not self._mounted:
+            return
+        try:
+            panel = self.query_one(MotorControlPanel)
+        except LookupError:
+            return
+        panel.update_controls(self.selected_esc, bus_online=self._bus_manager is not None)
 
     def _open_bus(self, channel: str) -> None:
         self._close_bus()
@@ -1803,6 +1923,7 @@ class DmTuiApp(App[None]):
         self._reapply_filters()
         self._log(f"Connected to {channel}.")
         self._update_bus_stats({"state": "Initializing"})
+        self._refresh_control_panel()
 
     def _close_bus(self) -> None:
         if self._bus_manager is not None:
@@ -1812,6 +1933,7 @@ class DmTuiApp(App[None]):
                 pass
             self._bus_manager.close()
             self._bus_manager = None
+        self._refresh_control_panel()
 
     def _ensure_telemetry_log(self) -> "TelemetryCsvWriter | None":
         if self._telemetry_log_writer is not None:
@@ -1877,12 +1999,57 @@ class DmTuiApp(App[None]):
             timestamp,
         )
 
+    def _maybe_update_limits(self, record: MotorRecord) -> bool:
+        esc_id = record.esc_id
+        metadata = record.metadata
+        if _has_limit_metadata(metadata):
+            self._limits_loaded.add(esc_id)
+            return False
+        if esc_id in self._limit_errors:
+            return False
+        bus = self._bus_manager
+        if bus is None:
+            return False
+        try:
+            refresh_params(bus, esc_id)
+        except BusManagerError as exc:  # pragma: no cover - hardware dependent
+            if esc_id not in self._limit_errors:
+                self._log(
+                    f"[yellow]Warning:[/yellow] Refresh limits failed for ESC 0x{esc_id:02X}: {exc}"
+                )
+            self._limit_errors.add(esc_id)
+            return False
+        try:
+            p_max = _coerce_positive(
+                read_param_float(bus, esc_id, params.RID_P_MAX, timeout=0.3),
+                DEFAULT_P_MAX,
+            )
+            v_max = _coerce_positive(
+                read_param_float(bus, esc_id, params.RID_V_MAX, timeout=0.3),
+                DEFAULT_V_MAX,
+            )
+            t_max = _coerce_positive(
+                read_param_float(bus, esc_id, params.RID_T_MAX, timeout=0.3),
+                DEFAULT_T_MAX,
+            )
+        except BusManagerError as exc:  # pragma: no cover - hardware dependent
+            if esc_id not in self._limit_errors:
+                self._log(
+                    f"[yellow]Warning:[/yellow] RID reads failed for ESC 0x{esc_id:02X}: {exc}"
+                )
+            self._limit_errors.add(esc_id)
+            return False
+        metadata.update({"p_max": p_max, "v_max": v_max, "t_max": t_max})
+        self._limits_loaded.add(esc_id)
+        self._limit_errors.discard(esc_id)
+        return True
+
     def _resolve_limits(self, esc_id: int) -> tuple[float, float, float]:
         record = self._motor_records.get(esc_id)
         metadata = record.metadata if record else {}
-        p_max = float(metadata.get("p_max", metadata.get("P_MAX", DEFAULT_P_MAX)))
-        v_max = float(metadata.get("v_max", metadata.get("V_MAX", DEFAULT_V_MAX)))
-        t_max = float(metadata.get("t_max", metadata.get("T_MAX", DEFAULT_T_MAX)))
+        p_max = _coerce_positive(metadata.get("p_max", metadata.get("P_MAX")), DEFAULT_P_MAX)
+        v_max = _coerce_positive(metadata.get("v_max", metadata.get("V_MAX")), DEFAULT_V_MAX)
+        t_max = _coerce_positive(metadata.get("t_max", metadata.get("T_MAX")), DEFAULT_T_MAX)
         return p_max, v_max, t_max
 
     def _resolve_mit_limits(self, esc_id: int) -> tuple[float, float, float, float, float]:
@@ -1890,17 +2057,10 @@ class DmTuiApp(App[None]):
         record = self._motor_records.get(esc_id)
         metadata = record.metadata if record else {}
 
-        def _coerce(value: object, default: float) -> float:
-            try:
-                candidate = float(value)
-            except (TypeError, ValueError):
-                return default
-            return abs(candidate) if candidate > 0 else default
-
         kp_source = metadata.get("kp_max", metadata.get("KP_MAX"))
         kd_source = metadata.get("kd_max", metadata.get("KD_MAX"))
-        kp_max = _coerce(kp_source, DEFAULT_KP_MAX)
-        kd_max = _coerce(kd_source, DEFAULT_KD_MAX)
+        kp_max = _coerce_positive(kp_source, DEFAULT_KP_MAX)
+        kd_max = _coerce_positive(kd_source, DEFAULT_KD_MAX)
         return p_max, v_max, t_max, kp_max, kd_max
 
     def _reapply_filters(self) -> None:
@@ -1937,6 +2097,10 @@ class DmTuiApp(App[None]):
 
     def get_commands(self) -> Iterable[Command]:  # pragma: no cover - UI integration
         commands = [
+            ("Enable Selected", "Enable the selected motor.", self.action_enable_selected),
+            ("Disable Selected", "Disable the selected motor.", self.action_disable_selected),
+            ("Zero Selected", "Send zero-position command to the selected motor.", self.action_zero_selected),
+            ("Set Velocity", "Prompt for a velocity setpoint for the selected motor.", self.action_set_velocity),
             ("MIT Command", "Send MIT-mode command to the selected motor.", self.action_set_mit),
             ("Launch Demo", "Open demo launcher dialog.", self.action_launch_demo),
             ("Stop Demo", "Stop any running demo and disable motors.", self.action_stop_demo),

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from struct import unpack
+from time import monotonic
 from typing import Iterable
 
 from .bus_manager import BusManager
-from .dmlib import protocol
+from .bus_manager import BusManagerError
+from .dmlib import protocol, params
 from .dmlib.params import RID_CTRL_MODE, RID_ESC_ID, RID_MST_ID
 
 
@@ -119,6 +122,45 @@ def command_mit_targets(bus: BusManager, targets: Iterable[MitTarget]) -> None:
         bus.send(arb_id, data)
 
 
+def read_param(bus: BusManager, esc_id: int, rid: int, *, timeout: float = 0.5) -> int:
+    """Read *rid* from *esc_id*, returning the raw 32-bit value."""
+
+    arb_id, payload = protocol.frame_param_read(esc_id, rid)
+    bus.send(arb_id, payload)
+    deadline = monotonic() + max(timeout, 0.0)
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        message = bus.get_message(timeout=min(0.05, remaining))
+        if message is None:
+            continue
+        if message.arbitration_id != protocol.MANAGEMENT_ARBITRATION_ID:
+            continue
+        try:
+            response = protocol.parse_management_response(message.data)
+        except ValueError:
+            continue
+        if response.command != params.MANAGEMENT_READ:
+            continue
+        if response.esc_id != esc_id:
+            continue
+        if response.rid != rid:
+            continue
+        return response.value
+    raise BusManagerError(
+        f"Timed out waiting for RID 0x{rid:02X} from ESC 0x{esc_id:02X}"
+    )
+
+
+def read_param_float(bus: BusManager, esc_id: int, rid: int, *, timeout: float = 0.5) -> float:
+    """Read *rid* from *esc_id* and interpret the response as a little-endian float."""
+
+    value = read_param(bus, esc_id, rid, timeout=timeout)
+    data = value.to_bytes(4, "little", signed=False)
+    return float(unpack("<f", data)[0])
+
+
 def write_param(bus: BusManager, esc_id: int, rid: int, value: int) -> None:
     arb_id, data = protocol.frame_param_write(esc_id, rid, value)
     bus.send(arb_id, data)
@@ -126,6 +168,11 @@ def write_param(bus: BusManager, esc_id: int, rid: int, value: int) -> None:
 
 def save_params(bus: BusManager, esc_id: int) -> None:
     arb_id, data = protocol.frame_param_save(esc_id)
+    bus.send(arb_id, data)
+
+
+def refresh_params(bus: BusManager, esc_id: int) -> None:
+    arb_id, data = protocol.frame_param_refresh(esc_id)
     bus.send(arb_id, data)
 
 

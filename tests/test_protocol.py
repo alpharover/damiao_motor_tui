@@ -1,6 +1,6 @@
 import pytest
 
-from dm_tui.dmlib import protocol
+from dm_tui.dmlib import params, protocol
 
 
 def _encode_feedback(status: int, esc_id: int, pos: int, vel: int, torque: int, mos: int, rotor: int) -> bytes:
@@ -39,10 +39,17 @@ def test_decode_feedback_round_trip():
 def test_frame_builders_have_correct_length():
     _, enable_data = protocol.frame_enable(1)
     assert len(enable_data) == 8
+    assert protocol.is_enable_payload(enable_data)
     _, speed_data = protocol.frame_speed(1, 3.14)
     assert len(speed_data) == 8
+    assert protocol.unpack_speed_payload(speed_data) == pytest.approx(3.14, rel=1e-6)
     _, pos_speed_data = protocol.frame_position_speed(1, 1.0, 2.0)
     assert len(pos_speed_data) == 8
+    position, velocity = protocol.unpack_position_speed_payload(pos_speed_data)
+    assert position == pytest.approx(1.0, rel=1e-6)
+    assert velocity == pytest.approx(2.0, rel=1e-6)
+    _, read_payload = protocol.frame_param_read(1, 0x10)
+    assert len(read_payload) == 8
 
 
 def test_frame_mit_round_trip_preserves_values():
@@ -96,3 +103,44 @@ def test_frame_mit_clamps_out_of_range_inputs():
     assert torque == pytest.approx(limits["torque_limit"], abs=1e-3)
     assert kp == pytest.approx(limits["kp_limit"], abs=1e-3)
     assert kd == pytest.approx(limits["kd_limit"], abs=1e-3)
+
+
+def test_enable_disable_zero_payload_helpers():
+    assert protocol.is_enable_payload(protocol.ENABLE_FRAME)
+    assert protocol.is_disable_payload(protocol.DISABLE_FRAME)
+    assert protocol.is_zero_payload(protocol.ZERO_FRAME)
+    with pytest.raises(ValueError):
+        protocol.unpack_speed_payload(b"\x00")
+    with pytest.raises(ValueError):
+        protocol.unpack_position_speed_payload(b"\x00")
+
+
+def test_management_frame_helpers_use_expected_layout():
+    arb_id, read_payload = protocol.frame_param_read(0x02, 0x0A)
+    assert arb_id == protocol.MANAGEMENT_ARBITRATION_ID
+    assert read_payload == bytes([0x02, 0x00, params.MANAGEMENT_READ, 0x0A, 0, 0, 0, 0])
+
+    arb_id, write_payload = protocol.frame_param_write(0x11, 0x07, 0x12345678)
+    assert arb_id == protocol.MANAGEMENT_ARBITRATION_ID
+    assert write_payload[:4] == bytes([0x11, 0x00, params.MANAGEMENT_WRITE, 0x07])
+    assert write_payload[4:] == b"xV4\x12"
+
+    arb_id, save_payload = protocol.frame_param_save(0x11)
+    assert arb_id == protocol.MANAGEMENT_ARBITRATION_ID
+    assert save_payload == bytes([0x11, 0x00, params.MANAGEMENT_SAVE, 0x00, 0, 0, 0, 0])
+
+    arb_id, refresh_payload = protocol.frame_param_refresh(0x11)
+    assert arb_id == protocol.MANAGEMENT_ARBITRATION_ID
+    assert refresh_payload == bytes([0x11, 0x00, params.MANAGEMENT_REFRESH, 0x00, 0, 0, 0, 0])
+
+
+def test_parse_management_response_round_trip():
+    data = bytes([0x11, 0x00, params.MANAGEMENT_READ, 0x07, 0x78, 0x56, 0x34, 0x12])
+    response = protocol.parse_management_response(data)
+    assert response.esc_id == 0x11
+    assert response.command == params.MANAGEMENT_READ
+    assert response.rid == 0x07
+    assert response.value == 0x12345678
+
+    with pytest.raises(ValueError):
+        protocol.parse_management_response(b"\x00")

@@ -13,7 +13,7 @@ Textual-powered terminal UI for discovering, configuring, and commanding Damiao 
 - CSV telemetry logging and optional `candump` capture for deep analysis.
 - Headless Textual UI with live bus diagnostics, discovery triggers, and keyboard E-STOP for quick triage.
 - ID assignment wizard writes ESC/MST IDs + CTRL_MODE via 0x7FF management frames, with metadata editor and group management built in.
-- Motor detail pane with enable/disable/zero shortcuts, velocity prompt, and live telemetry summaries.
+- Motor detail pane with adjacent control panel (enable/disable/zero/velocity/MIT) and live telemetry summaries.
 
 ## Architecture Overview
 ```
