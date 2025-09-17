@@ -19,7 +19,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.command import Command, DiscoveryHit
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sparkline, Static, TextLog
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Log, Sparkline, Static
 
 from .bus_manager import BusManager, BusManagerError, PeriodicTask
 from .controllers import (
@@ -232,7 +232,7 @@ class MotorTable(DataTable):
         return [int(key) for key in self._row_keys]
 
 
-class ActivityLog(TextLog):
+class ActivityLog(Log):
     """Scrolling log widget."""
 
     DEFAULT_CSS = """
@@ -788,17 +788,16 @@ class DmTuiApp(App[None]):
     def __init__(self, config_path: Path | None = None) -> None:
         super().__init__()
         self._config_path = config_path
+        self._threads_lock = threading.Lock()
+        self._mounted = False
         self._config: AppConfig = load_config(config_path)
-        self.active_bus = self._config.active_bus
-        ensure_bus(self._config, self.active_bus, make_active=True)
+        ensure_bus(self._config, self._config.active_bus, make_active=True)
         self._motor_records: Dict[int, MotorRecord] = {
             record.esc_id: record for record in self._config.motors
         }
         self._motors: Dict[int, MotorInfo] = {}
         self._telemetry: Dict[int, TelemetryRecord] = {}
         self._telemetry_history: Dict[int, Deque[float]] = {}
-        self._torque_history: Dict[int, Deque[float]] = {}
-        self._temp_history: Dict[int, Deque[int]] = {}
         self._torque_history: Dict[int, Deque[float]] = {}
         self._temp_history: Dict[int, Deque[int]] = {}
         self._groups: Dict[str, GroupRecord] = {
@@ -811,11 +810,9 @@ class DmTuiApp(App[None]):
         self._demo_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
         self._demo_tasks: list[PeriodicTask] = []
-        self._demo_tasks: list[PeriodicTask] = []
         self._discovery_running = False
         self._bus_stats_running = False
-        self._threads_lock = threading.Lock()
-        self._mounted = False
+        self.active_bus = self._config.active_bus
 
     def compose(self) -> ComposeResult:
         yield Header()
