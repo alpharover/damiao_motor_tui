@@ -1898,7 +1898,7 @@ class DmTuiApp(App[None]):
             return
         try:
             panel = self.query_one(MotorControlPanel)
-        except LookupError:
+        except (LookupError, NoMatches):
             return
         panel.update_controls(self.selected_esc, bus_online=self._bus_manager is not None)
 
