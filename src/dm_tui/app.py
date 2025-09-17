@@ -1145,6 +1145,7 @@ class DmTuiApp(App[None]):
             if _has_limit_metadata(record.metadata)
         }
         self._limit_errors: set[int] = set()
+        self._warned_esc_zero = False
         self.active_bus = self._config.active_bus
 
     def compose(self) -> ComposeResult:
@@ -1726,7 +1727,13 @@ class DmTuiApp(App[None]):
                 return
             motors = passive_sniff(bus, duration=0.6)
             if (not motors or force_active) and bus is not None:
-                motors.extend(active_probe(bus))
+                try:
+                    motors.extend(active_probe(bus))
+                except BusManagerError as exc:
+                    self.call_from_thread(
+                        self._log,
+                        f"[yellow]Discovery warning:[/yellow] active probe skipped ({exc}).",
+                    )
         except Exception as exc:  # pragma: no cover - hardware dependent
             self.call_from_thread(self._log, f"[red]Discovery error:[/red] {exc}")
         else:
@@ -1772,6 +1779,13 @@ class DmTuiApp(App[None]):
             self._persist_config()
 
     def _ingest_feedback(self, esc_id: int, feedback: Feedback, mst_id: int, timestamp: float) -> None:
+        if esc_id == 0:
+            if not getattr(self, "_warned_esc_zero", False):
+                self._log(
+                    "[yellow]Ignored feedback with ESC ID 0x00 (possible malformed frame).[/yellow]"
+                )
+                self._warned_esc_zero = True
+            return
         record = self._motor_records.get(esc_id)
         config_changed = False
         if record is None:
