@@ -377,8 +377,8 @@ class MotorControlPanel(Static):
     }
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, *children, **kwargs) -> None:
+        super().__init__(*children, **kwargs)
         self._info = Static("Select a motor to enable controls.", id="motor-control-info")
         specs = [
             ("control-enable", "Enable", "action_enable_selected"),
