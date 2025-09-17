@@ -36,6 +36,7 @@ dm_tui/
 - Raspberry Pi 5, Ubuntu 24.04, Waveshare 2-CH CAN HAT+ on SPI1 (`spi1-3cs` overlay).
 - Systemd `.link` files map `canA` (SPI1 CE1) and `canB` (SPI1 CE2) for predictable naming.
 - Motors ship with 1 Mbps CAN, default `ESC_ID`/`MST_ID` pairs (`0x01/0x11`, `0x02/0x12` currently in bench setup).
+- 2025‑09‑17 note: manual enable/velocity/disable frames emitted on `canB` produced no motor motion and `candump` showed no traffic; investigate wiring/termination or competing CAN clients before the next bench run.
 
 ## Setup
 ```bash
