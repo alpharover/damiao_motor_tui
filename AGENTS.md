@@ -39,7 +39,6 @@ Welcome to the **dm-tui** project. This guide orients any agent working on the R
 4. **Testing** – maintain unit tests for protocol packers, discovery logic, and persistence. Confirm on hardware for anything that touches motion.
 5. **Git Hygiene** – feature branches preferred. Use the repo’s SSH remote (`git@github.com:alpharover/damiao_motor_tui.git`).
 
-### Current TUI Key Bindings
 - `Space`: global E-STOP
 - `R`: passive + active discovery sweep
 - `B`: cycle between configured CAN buses
@@ -47,8 +46,10 @@ Welcome to the **dm-tui** project. This guide orients any agent working on the R
 - `V`: prompt for a velocity command (rad/s) for the highlighted motor
 - `A`: launch ID assignment wizard (writes ESC/MST IDs & CTRL_MODE, saves params)
 - `M`: edit metadata (friendly name, group tag, P/V/T limits)
-- `G`: manage motor groups (define ESC ID sets for orchestration)
-- `:`: open the command palette
+- `Ctrl+M`: edit group membership directly
+- `Ctrl+G`: run group actions (enable/disable/velocity)
+- `Ctrl+D`: launch demo choreography (`Ctrl+Shift+D` to stop)
+- `:`: open the command palette (demo/group/save shortcuts available)
 - `Ctrl+S`: persist configuration to disk
 
 ## Useful Utilities

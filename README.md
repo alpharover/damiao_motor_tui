@@ -71,6 +71,8 @@ sudo ifconfig canB txqueuelen 65536
 - Use `Ctrl+G` to run group actions (enable, disable, broadcast velocity) and `Ctrl+M` to edit group membership lists directly.
 - Launch choreographed demos with `Ctrl+D` (Sine Orchestra, Handshake Duet, Figure Eight). Demos drive phase-offset velocity profiles across the chosen group or the entire bench and can be halted with `Ctrl+Shift+D`.
 - All demo traffic runs through SocketCAN in real time; the telemetry panel and motor detail view update continuously for quick health checks.
+- Velocity sparkline: the left column now includes a history plot of the highlighted motor’s velocity (rolling window of recent samples) for quick trend spotting.
+- The command palette (`:`) exposes quick actions for launching/stopping demos, triggering discovery, running group actions, and saving configuration.
 
 ### Testing Strategy
 - Unit tests on protocol packers, MIT bit packing, and feedback decoding using `vcan`.

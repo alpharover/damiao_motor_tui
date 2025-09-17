@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import threading
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Dict, Iterable, Optional
+from typing import Deque, Dict, Iterable, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -17,7 +18,8 @@ from textual.events import Mount
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static, TextLog
+from textual.command import Command, DiscoveryHit
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sparkline, Static, TextLog
 
 from .bus_manager import BusManager, BusManagerError
 from .controllers import (
@@ -393,6 +395,43 @@ class GroupPanel(Static):
         self.update("\n".join(lines))
 
 
+class VelocitySparkline(Static):
+    """Sparkline showing recent velocity history for the selected motor."""
+
+    DEFAULT_CSS = """
+    VelocitySparkline {
+        border: round $accent;
+        height: 6;
+        padding: 1 1;
+    }
+    VelocitySparkline > #velocity-sparkline {
+        height: 2;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+    """
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self._spark = Sparkline(id="velocity-sparkline")
+        self._caption = Label("Select a motor to view velocity history.", id="velocity-caption")
+
+    def compose(self) -> ComposeResult:
+        yield Label("Velocity History", id="velocity-title")
+        yield self._spark
+        yield self._caption
+
+    def update_series(self, esc_id: Optional[int], values: Iterable[float]) -> None:
+        series = list(values)
+        self._spark.data = series if series else None
+        if esc_id is None:
+            self._caption.update("Select a motor to view velocity history.")
+        elif not series:
+            self._caption.update(f"ESC 0x{esc_id:02X}: no velocity samples yet.")
+        else:
+            self._caption.update(f"ESC 0x{esc_id:02X}: last {len(series)} samples")
+
+
 class VelocityModal(ModalScreen[Optional[float]]):
     """Modal dialog requesting a velocity setpoint."""
 
@@ -757,6 +796,7 @@ class DmTuiApp(App[None]):
         }
         self._motors: Dict[int, MotorInfo] = {}
         self._telemetry: Dict[int, TelemetryRecord] = {}
+        self._telemetry_history: Dict[int, Deque[float]] = {}
         self._groups: Dict[str, GroupRecord] = {
             group.name: GroupRecord(name=group.name, esc_ids=list(group.esc_ids))
             for group in self._config.groups
@@ -778,6 +818,7 @@ class DmTuiApp(App[None]):
                 yield BusStatusPanel(id="bus-status")
                 yield MotorTable(id="motor-table")
                 yield TelemetryPanel(id="telemetry-panel")
+                yield VelocitySparkline(id="velocity-history")
             with Vertical(id="right-column"):
                 yield MotorDetailPanel(id="motor-detail")
                 yield GroupPanel(id="group-panel")
@@ -1053,6 +1094,9 @@ class DmTuiApp(App[None]):
         tele = self._telemetry.pop(current_esc, None)
         if tele:
             self._telemetry[result.esc_id] = tele
+        history = self._telemetry_history.pop(current_esc, None)
+        if history:
+            self._telemetry_history[result.esc_id] = history
         for group in self._groups.values():
             group.esc_ids = [result.esc_id if esc == current_esc else esc for esc in group.esc_ids]
         self._cleanup_empty_groups()
@@ -1278,6 +1322,8 @@ class DmTuiApp(App[None]):
             velocity_rad_s=engineering.velocity_rad_s,
             torque_nm=engineering.torque_nm,
         )
+        history = self._telemetry_history.setdefault(esc_id, deque(maxlen=200))
+        history.append(engineering.velocity_rad_s)
         self._motors[esc_id] = MotorInfo(esc_id=esc_id, mst_id=mst_id, last_seen=timestamp)
         record = self._motor_records.get(esc_id)
         config_changed = False
@@ -1295,6 +1341,7 @@ class DmTuiApp(App[None]):
         self._refresh_motor_table()
         self._refresh_telemetry_panel()
         self._refresh_detail_panel()
+        self._refresh_velocity_sparkline()
         self._reapply_filters()
         if config_changed:
             self._persist_config()
@@ -1323,6 +1370,7 @@ class DmTuiApp(App[None]):
         esc_id = self.selected_esc
         if esc_id is None:
             panel.show_idle()
+            self._refresh_velocity_sparkline()
             return
         panel.show_details(
             esc_id=esc_id,
@@ -1331,6 +1379,7 @@ class DmTuiApp(App[None]):
             telemetry=self._telemetry.get(esc_id),
             now=monotonic(),
         )
+        self._refresh_velocity_sparkline()
 
     def _refresh_telemetry_panel(self) -> None:
         panel = self.query_one(TelemetryPanel)
@@ -1339,6 +1388,12 @@ class DmTuiApp(App[None]):
     def _refresh_group_panel(self) -> None:
         panel = self.query_one(GroupPanel)
         panel.update_groups(self._groups)
+
+    def _refresh_velocity_sparkline(self) -> None:
+        panel = self.query_one(VelocitySparkline)
+        esc_id = self.selected_esc
+        history = self._telemetry_history.get(esc_id, []) if esc_id is not None else []
+        panel.update_series(esc_id, history)
 
     def _refresh_hint_panel(self) -> None:
         panel = self.query_one(HintPanel)
@@ -1441,6 +1496,24 @@ class DmTuiApp(App[None]):
     def action_manage_groups(self) -> None:
         modal = GroupModal(self._groups)
         self.push_screen(modal, callback=self._apply_group_definition)
+
+    def get_commands(self) -> Iterable[Command]:  # pragma: no cover - UI integration
+        commands = [
+            ("Launch Demo", "Open demo launcher dialog.", self.action_launch_demo),
+            ("Stop Demo", "Stop any running demo and disable motors.", self.action_stop_demo),
+            ("Group Actions", "Run enable/disable/velocity against a group.", self.action_prompt_group_action),
+            ("Save Config", "Persist current configuration to disk.", self.action_save_config),
+            ("Trigger Discovery", "Run passive + active motor discovery.", self.action_trigger_discovery),
+        ]
+        for text, help_text, func in commands:
+            yield Command(
+                text,
+                DiscoveryHit(
+                    text,
+                    lambda func=func: self.call_from_thread(func),
+                    help=help_text,
+                ),
+            )
 
 
 def run(config_path: Path | None = None) -> None:
