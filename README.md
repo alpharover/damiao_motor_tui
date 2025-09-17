@@ -66,6 +66,12 @@ sudo ifconfig canB txqueuelen 65536
 5. Leverage global E-STOP (`Space`) before editing demo scripts or periodic tasks.
 6. Cycle CAN buses with `B`, trigger discovery with `R` (safe active probe fallback), use `E/D/Z` to enable/disable/zero the highlighted motor, `V` for velocity prompts, `A` to run the ID assignment wizard, `M` to edit metadata (name, limits, group), `G` to manage groups, and persist config updates via `Ctrl+S`.
 
+## Groups & Demos
+- Tag motors with friendly names, limits, and group memberships via `M` (metadata modal). Groups persist in the YAML config and appear in the right-hand panel.
+- Use `Ctrl+G` to run group actions (enable, disable, broadcast velocity) and `Ctrl+M` to edit group membership lists directly.
+- Launch choreographed demos with `Ctrl+D` (Sine Orchestra, Handshake Duet, Figure Eight). Demos drive phase-offset velocity profiles across the chosen group or the entire bench and can be halted with `Ctrl+Shift+D`.
+- All demo traffic runs through SocketCAN in real time; the telemetry panel and motor detail view update continuously for quick health checks.
+
 ### Testing Strategy
 - Unit tests on protocol packers, MIT bit packing, and feedback decoding using `vcan`.
 - Loopback smoke tests with `cangen`/`candump` to confirm filters and reader behavior.

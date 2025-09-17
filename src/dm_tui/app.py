@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,8 +21,11 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Sta
 
 from .bus_manager import BusManager, BusManagerError
 from .controllers import (
+    MotorTarget,
     assign_motor_ids,
     command_velocity,
+    command_velocities,
+    enable_all,
     disable,
     disable_all,
     enable,
@@ -84,6 +88,51 @@ class MetadataUpdate:
 class GroupDefinition:
     name: str
     esc_ids: list[int]
+
+
+@dataclass(slots=True)
+class DemoDefinition:
+    key: str
+    title: str
+    description: str
+    amplitude_rps: float
+    frequency_hz: float
+    mode: str
+
+
+@dataclass(slots=True)
+class ActiveDemo:
+    definition: DemoDefinition
+    esc_ids: list[int]
+    start_time: float
+
+
+DEMO_DEFINITIONS: list[DemoDefinition] = [
+    DemoDefinition(
+        key="sine",
+        title="Sine Orchestra",
+        description="Phase-offset sine wave across the selected group.",
+        amplitude_rps=30 * 2 * math.pi / 60,
+        frequency_hz=0.5,
+        mode="sine",
+    ),
+    DemoDefinition(
+        key="handshake",
+        title="Handshake Duet",
+        description="Alternate motors in antiphase with shared amplitude.",
+        amplitude_rps=40 * 2 * math.pi / 60,
+        frequency_hz=0.4,
+        mode="antiphase",
+    ),
+    DemoDefinition(
+        key="figure8",
+        title="Figure Eight",
+        description="Lissajous-inspired offsets for up to 8 motors.",
+        amplitude_rps=35 * 2 * math.pi / 60,
+        frequency_hz=0.35,
+        mode="figure8",
+    ),
+]
 
 
 class BusStatusPanel(Static):
@@ -202,7 +251,7 @@ class HintPanel(Static):
     DEFAULT_CSS = """
     HintPanel {
         border: round $accent;
-        height: 10;
+        height: 12;
         padding: 1 1;
     }
     """
@@ -220,7 +269,14 @@ class HintPanel(Static):
                     "B      Cycle Bus",
                     "E/D/Z Enable/Disable/Zero",
                     "V      Set Velocity",
+                    "A      ID Wizard",
+                    "M      Edit Metadata",
+                    "Ctrl+M Edit Groups",
+                    "Ctrl+G Group Actions",
+                    "Ctrl+D Launch Demo",
+                    "Ctrl+Shift+D Stop Demo",
                     "Ctrl+S Save Config",
+                    ":      Command Palette",
                 ]
             )
         )
@@ -264,9 +320,11 @@ class MotorDetailPanel(Static):
         if info:
             last_seen = f"{max(0.0, now - info.last_seen):0.1f}s ago"
         name = record.name if record and record.name else "--"
+        group = record.group if record and record.group else "--"
         lines = [
             f"[b]ESC[/b] 0x{esc_id:02X} | [b]MST[/b] 0x{mst_id:03X}",
             f"[b]Name[/b] {name}",
+            f"[b]Group[/b] {group}",
             f"[b]Last Seen[/b] {last_seen}",
             f"[b]Temps[/b] {temps}",
             f"[b]Velocity[/b] {velocity}",
@@ -324,12 +382,14 @@ class GroupPanel(Static):
 
     def update_groups(self, groups: Dict[str, GroupRecord]) -> None:
         if not groups:
-            self.update("No groups configured. Press G to add one.")
+            self.update("No groups configured. Press M to tag motors or Ctrl+G to define one.")
             return
         lines = ["[b]Groups[/b]"]
         for name, record in sorted(groups.items()):
-            escs = ", ".join(f"0x{esc:02X}" for esc in record.esc_ids) or "(empty)"
+            escs = ", ".join(f"0x{esc:02X}" for esc in sorted(record.esc_ids)) or "(empty)"
             lines.append(f"{name}: {escs}")
+        lines.append("")
+        lines.append("Ctrl+G to run actions · Ctrl+D to launch demos")
         self.update("\n".join(lines))
 
 
@@ -374,12 +434,40 @@ class VelocityModal(ModalScreen[Optional[float]]):
         self.dismiss(value)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        try:
-            apply_button = self.query_one("#apply", Button)
-        except LookupError:
+        apply_button = self.query_one("#apply", Button)
+        self.on_button_pressed(Button.Pressed(apply_button))
+
+
+class GroupVelocityModal(ModalScreen[Optional[float]]):
+    """Collect a velocity setpoint for a group."""
+
+    def __init__(self, group: str) -> None:
+        super().__init__()
+        self._group = group
+        self._input = Input(placeholder="rad/s (applied to each motor)")
+        self._error = Label("")
+
+    def compose(self) -> ComposeResult:
+        yield Static(f"Set velocity for group '{self._group}'", id="gvel-title")
+        yield self._input
+        yield self._error
+        with Horizontal(id="gvel-buttons"):
+            yield Button("Cancel", id="cancel")
+            yield Button("Apply", id="apply", variant="primary")
+
+    def on_mount(self, event: Mount) -> None:  # noqa: D401
+        self.set_focus(self._input)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
             self.dismiss(None)
             return
-        self.on_button_pressed(Button.Pressed(apply_button))
+        try:
+            value = float(self._input.value.strip())
+        except ValueError:
+            self._error.update("Enter a numeric rad/s value.")
+            return
+        self.dismiss(value)
 
 
 class IdWizardModal(ModalScreen[Optional[IdAssignmentResult]]):
@@ -397,18 +485,18 @@ class IdWizardModal(ModalScreen[Optional[IdAssignmentResult]]):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            "Assign new IDs. The wizard writes ESC_ID, MST_ID, CTRL_MODE and saves params.",
+            "Assign new IDs. Writes ESC_ID, MST_ID, CTRL_MODE and persists via SAVE.",
             id="id-title",
         )
-        self._esc_input = Input(str(self._current_esc), placeholder="New ESC ID (decimal)", id="id-esc")
-        yield Label("ESC ID", classes="form-label")
+        self._esc_input = Input(str(self._current_esc), placeholder="New ESC ID (decimal or 0x)", id="id-esc")
+        yield Label("ESC ID")
         yield self._esc_input
         default_mst = self._current_mst if self._current_mst else (self._current_esc + 0x10)
-        self._mst_input = Input(str(default_mst), placeholder="New MST ID (decimal)", id="id-mst")
-        yield Label("MST ID", classes="form-label")
+        self._mst_input = Input(str(default_mst), placeholder="New MST ID", id="id-mst")
+        yield Label("MST ID")
         yield self._mst_input
-        self._mode_input = Input(str(self._default_mode), placeholder="CTRL_MODE (e.g. 3 for velocity)", id="id-mode")
-        yield Label("Control Mode", classes="form-label")
+        self._mode_input = Input(str(self._default_mode), placeholder="CTRL_MODE (e.g. 3)", id="id-mode")
+        yield Label("Control Mode")
         yield self._mode_input
         self._error = Label("", id="id-error")
         yield self._error
@@ -420,27 +508,29 @@ class IdWizardModal(ModalScreen[Optional[IdAssignmentResult]]):
         if self._esc_input:
             self.set_focus(self._esc_input)
 
-    def _read_int(self, inp: Input | None, label: str) -> Optional[int]:
+    def _parse_value(self, inp: Input | None, label: str) -> Optional[int]:
         if inp is None:
             return None
-        value = inp.value.strip()
-        if not value:
+        raw = inp.value.strip()
+        if not raw:
+            if self._error:
+                self._error.update(f"{label} is required.")
             return None
         try:
-            base = 16 if value.lower().startswith("0x") else 10
-            return int(value, base)
+            base = 16 if raw.lower().startswith("0x") else 10
+            return int(raw, base)
         except ValueError:
             if self._error:
-                self._error.update(f"{label} must be numeric (decimal or 0x prefixed).")
+                self._error.update(f"{label} must be numeric.")
             return None
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
             self.dismiss(None)
             return
-        esc_id = self._read_int(self._esc_input, "ESC ID")
-        mst_id = self._read_int(self._mst_input, "MST ID")
-        mode = self._read_int(self._mode_input, "Control mode")
+        esc_id = self._parse_value(self._esc_input, "ESC ID")
+        mst_id = self._parse_value(self._mst_input, "MST ID")
+        mode = self._parse_value(self._mode_input, "Control mode")
         if esc_id is None or mst_id is None or mode is None:
             return
         if not (1 <= esc_id <= 0x7F and 1 <= mst_id <= 0x7FF):
@@ -455,10 +545,10 @@ class MetadataModal(ModalScreen[Optional[MetadataUpdate]]):
 
     def __init__(self, esc_id: int, record: MotorRecord | None) -> None:
         super().__init__()
+        metadata = record.metadata if record else {}
         self._esc_id = esc_id
         self._name_input = Input(record.name or "" if record else "", placeholder="Display name")
         self._group_input = Input(record.group or "" if record else "", placeholder="Group name")
-        metadata = record.metadata if record else {}
         self._p_input = Input(str(metadata.get("p_max", "")), placeholder="P_MAX (rad)")
         self._v_input = Input(str(metadata.get("v_max", "")), placeholder="V_MAX (rad/s)")
         self._t_input = Input(str(metadata.get("t_max", "")), placeholder="T_MAX (Nm)")
@@ -494,15 +584,15 @@ class MetadataModal(ModalScreen[Optional[MetadataUpdate]]):
 
 
 class GroupModal(ModalScreen[Optional[GroupDefinition]]):
-    """Create or edit a group definition."""
+    """Create or update a group definition."""
 
     def __init__(self, existing: Dict[str, GroupRecord]) -> None:
         super().__init__()
-        name_placeholder = "Group name"
-        self._name_input = Input(placeholder=name_placeholder, id="group-name")
-        self._esc_input = Input(placeholder="ESC IDs (comma or space separated)", id="group-escs")
-        self._error: Label | None = None
-        self._existing = existing
+        default_name = next(iter(existing.keys()), "demo")
+        self._name_input = Input(default_name, placeholder="Group name")
+        default_escs = " ".join(f"0x{esc:02X}" for esc in existing.get(default_name, GroupRecord(default_name, [])).esc_ids)
+        self._esc_input = Input(default_escs, placeholder="ESC IDs (comma/space, allow 0x)")
+        self._error = Label("")
 
     def compose(self) -> ComposeResult:
         yield Static("Define a group for synchronized commands.", id="group-title")
@@ -510,7 +600,6 @@ class GroupModal(ModalScreen[Optional[GroupDefinition]]):
         yield self._name_input
         yield Label("ESC IDs")
         yield self._esc_input
-        self._error = Label("", id="group-error")
         yield self._error
         with Horizontal(id="group-buttons"):
             yield Button("Cancel", id="cancel")
@@ -522,7 +611,7 @@ class GroupModal(ModalScreen[Optional[GroupDefinition]]):
             return
         name = self._name_input.value.strip()
         if not name:
-            self._set_error("Name required.")
+            self._error.update("[red]Name required.[/red]")
             return
         esc_field = self._esc_input.value.replace(",", " ")
         esc_tokens = [tok for tok in esc_field.split() if tok]
@@ -532,16 +621,83 @@ class GroupModal(ModalScreen[Optional[GroupDefinition]]):
                 base = 16 if tok.lower().startswith("0x") else 10
                 esc_ids.append(int(tok, base))
             except ValueError:
-                self._set_error(f"Invalid ESC ID token: {tok}")
+                self._error.update(f"[red]Invalid ESC ID token: {tok}[/red]")
                 return
-        if name in self._existing and esc_ids == self._existing[name].esc_ids:
-            self.dismiss(None)
-            return
         self.dismiss(GroupDefinition(name=name, esc_ids=esc_ids))
 
-    def _set_error(self, message: str) -> None:
-        if self._error:
-            self._error.update(f"[red]{message}[/red]")
+
+class GroupActionModal(ModalScreen[Optional[tuple[str, str]]]):
+    """Prompt for a group action."""
+
+    def __init__(self, groups: Dict[str, GroupRecord]) -> None:
+        super().__init__()
+        self._groups = groups
+        default = next(iter(groups.keys()), "")
+        self._group_input = Input(default, placeholder="Group name")
+        self._error = Label("")
+
+    def compose(self) -> ComposeResult:
+        yield Static("Select group action (enable/disable/velocity).", id="gact-title")
+        yield Label("Group Name")
+        yield self._group_input
+        yield self._error
+        with Horizontal(id="gact-buttons"):
+            yield Button("Enable", id="enable", variant="primary")
+            yield Button("Disable", id="disable")
+            yield Button("Velocity", id="velocity")
+            yield Button("Cancel", id="cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        group = self._group_input.value.strip()
+        if not group:
+            self._error.update("[red]Provide a group name.[/red]")
+            return
+        if self._groups and group not in self._groups:
+            self._error.update(f"[red]Unknown group '{group}'.[/red]")
+            return
+        self.dismiss((event.button.id, group))
+
+
+class DemoModal(ModalScreen[Optional[tuple[str, str]]]):
+    """Prompt for demo and group selection."""
+
+    def __init__(self, demos: Iterable[DemoDefinition], groups: Dict[str, GroupRecord]) -> None:
+        super().__init__()
+        self._demos = {demo.key: demo for demo in demos}
+        self._groups = groups
+        default_group = next(iter(groups.keys()), "ALL")
+        self._demo_input = Input(next(iter(self._demos.keys()), "sine"), placeholder="Demo key (sine/handshake/figure8)")
+        self._group_input = Input(default_group, placeholder="Group name or ALL")
+        self._error = Label("")
+
+    def compose(self) -> ComposeResult:
+        demos = "\n".join(f" - {demo.key}: {demo.title}" for demo in self._demos.values())
+        yield Static(f"Available demos:\n{demos}", id="demo-list")
+        yield Label("Demo Key")
+        yield self._demo_input
+        yield Label("Group (or 'ALL')")
+        yield self._group_input
+        yield self._error
+        with Horizontal(id="demo-buttons"):
+            yield Button("Cancel", id="cancel")
+            yield Button("Launch", id="launch", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        demo_key = self._demo_input.value.strip()
+        if demo_key not in self._demos:
+            self._error.update(f"[red]Unknown demo '{demo_key}'.[/red]")
+            return
+        group_name = self._group_input.value.strip() or "ALL"
+        if group_name != "ALL" and group_name not in self._groups:
+            self._error.update(f"[red]Unknown group '{group_name}'.[/red]")
+            return
+        self.dismiss((demo_key, group_name))
 
 
 class DmTuiApp(App[None]):
@@ -578,7 +734,10 @@ class DmTuiApp(App[None]):
         Binding("v", "set_velocity", "Velocity", show=True),
         Binding("a", "assign_ids", "Assign IDs", show=True),
         Binding("m", "edit_metadata", "Edit Metadata", show=True),
-        Binding("g", "manage_groups", "Groups", show=True),
+        Binding("ctrl+m", "manage_groups", "Edit Groups", show=True),
+        Binding("ctrl+g", "prompt_group_action", "Group Actions", show=True),
+        Binding("ctrl+d", "launch_demo", "Launch Demo", show=True),
+        Binding("ctrl+shift+d", "stop_demo", "Stop Demo", show=True),
         Binding(":", "open_command_palette", "Command Palette", show=False),
         Binding("ctrl+s", "save_config", "Save config", show=False),
         Binding("ctrl+c", "quit", "Quit", show=False),
@@ -605,6 +764,8 @@ class DmTuiApp(App[None]):
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
+        self._demo_timer: Timer | None = None
+        self._active_demo: ActiveDemo | None = None
         self._discovery_running = False
         self._bus_stats_running = False
         self._threads_lock = threading.Lock()
@@ -639,6 +800,7 @@ class DmTuiApp(App[None]):
             self._bus_stats_timer.stop()
         if self._discovery_timer:
             self._discovery_timer.stop()
+        self._stop_demo(disable=False)
         self._close_bus()
         self._mounted = False
 
@@ -656,7 +818,10 @@ class DmTuiApp(App[None]):
         self._refresh_hint_panel()
         self._refresh_detail_panel()
 
+    # --- Actions -----------------------------------------------------------
+
     def action_estop(self) -> None:
+        self._stop_demo(disable=False)
         esc_ids = sorted(set(self._motor_records.keys()) | set(self._motors.keys()))
         if not esc_ids:
             self._log("No motors recorded for E-STOP.")
@@ -691,6 +856,7 @@ class DmTuiApp(App[None]):
         esc_id = self._require_selected_motor()
         if esc_id is None or not self._bus_manager:
             return
+        self._stop_demo(disable=False)
         try:
             enable(self._bus_manager, esc_id)
         except BusManagerError as exc:  # pragma: no cover
@@ -702,6 +868,7 @@ class DmTuiApp(App[None]):
         esc_id = self._require_selected_motor()
         if esc_id is None or not self._bus_manager:
             return
+        self._stop_demo(disable=False)
         try:
             disable(self._bus_manager, esc_id)
         except BusManagerError as exc:  # pragma: no cover
@@ -713,6 +880,7 @@ class DmTuiApp(App[None]):
         esc_id = self._require_selected_motor()
         if esc_id is None or not self._bus_manager:
             return
+        self._stop_demo(disable=False)
         try:
             zero(self._bus_manager, esc_id)
         except BusManagerError as exc:  # pragma: no cover
@@ -755,9 +923,25 @@ class DmTuiApp(App[None]):
         modal = MetadataModal(esc_id, self._motor_records.get(esc_id))
         self.push_screen(modal, callback=lambda update: self._apply_metadata_update(esc_id, update))
 
-    def action_manage_groups(self) -> None:
-        modal = GroupModal(self._groups)
-        self.push_screen(modal, callback=self._apply_group_definition)
+    def action_prompt_group_action(self) -> None:
+        if not self._groups:
+            self._log("Define a group first (press M to tag motors).")
+            return
+        modal = GroupActionModal(self._groups)
+        self.push_screen(modal, callback=self._handle_group_action)
+
+    def action_launch_demo(self) -> None:
+        if not self._groups and not (self._motor_records or self._motors):
+            self._log("No motors available. Discover or configure groups first.")
+            return
+        modal = DemoModal(DEMO_DEFINITIONS, self._groups)
+        self.push_screen(modal, callback=self._handle_demo_selection)
+
+    def action_stop_demo(self) -> None:
+        if self._active_demo is None:
+            self._log("No demo running.")
+            return
+        self._stop_demo(disable=True)
 
     def action_save_config(self) -> None:
         self._persist_config()
@@ -766,12 +950,21 @@ class DmTuiApp(App[None]):
     def action_open_command_palette(self) -> None:
         super().action_command_palette()
 
+    # --- Internal helpers --------------------------------------------------
+
+    def _require_selected_motor(self) -> Optional[int]:
+        if self.selected_esc is None:
+            self._log("Select a motor row first.")
+            return None
+        return self.selected_esc
+
     def _apply_velocity(self, esc_id: int, value: Optional[float]) -> None:
         if value is None:
             return
         if not self._bus_manager:
             self._log("[red]Velocity ignored; bus offline.[/red]")
             return
+        self._stop_demo(disable=False)
         try:
             command_velocity(self._bus_manager, esc_id, value)
         except BusManagerError as exc:  # pragma: no cover
@@ -779,12 +972,55 @@ class DmTuiApp(App[None]):
         else:
             self._log(f"Velocity {value:0.2f} rad/s sent to ESC 0x{esc_id:02X}.")
 
+    def _handle_group_action(self, result: Optional[tuple[str, str]]) -> None:
+        if result is None:
+            return
+        action, group = result
+        if action == "velocity":
+            modal = GroupVelocityModal(group)
+            self.push_screen(modal, callback=lambda value: self._execute_group_action(action, group, velocity=value))
+            return
+        self._execute_group_action(action, group)
+
+    def _execute_group_action(self, action: str, group_name: str, *, velocity: float | None = None) -> None:
+        group = self._groups.get(group_name)
+        if group is None:
+            self._log(f"[red]Group '{group_name}' not found.[/red]")
+            return
+        esc_ids = [esc for esc in group.esc_ids if esc is not None]
+        if not esc_ids:
+            self._log(f"Group '{group_name}' is empty.")
+            return
+        if not self._bus_manager:
+            self._log("[red]Bus offline; group command ignored.[/red]")
+            return
+        self._stop_demo(disable=False)
+        try:
+            if action == "enable":
+                enable_all(self._bus_manager, esc_ids)
+                self._log(f"Enabled group '{group_name}' ({len(esc_ids)} motors).")
+            elif action == "disable":
+                disable_all(self._bus_manager, esc_ids)
+                self._log(f"Disabled group '{group_name}'.")
+            elif action == "velocity":
+                if velocity is None:
+                    self._log("[red]Velocity value required.[/red]")
+                    return
+                targets = [MotorTarget(esc_id=esc, velocity_rad_s=velocity) for esc in esc_ids]
+                command_velocities(self._bus_manager, targets)
+                self._log(f"Velocity {velocity:0.2f} rad/s sent to group '{group_name}'.")
+            else:
+                self._log(f"[red]Unknown group action '{action}'.[/red]")
+        except BusManagerError as exc:  # pragma: no cover
+            self._log(f"[red]Group action failed:[/red] {exc}")
+
     def _apply_id_assignment(self, current_esc: int, result: Optional[IdAssignmentResult]) -> None:
         if result is None:
             return
         if not self._bus_manager:
             self._log("[red]Cannot write IDs; bus offline.[/red]")
             return
+        self._stop_demo(disable=False)
         try:
             assign_motor_ids(
                 self._bus_manager,
@@ -843,7 +1079,6 @@ class DmTuiApp(App[None]):
                 record.metadata.pop(key, None)
             else:
                 record.metadata[key] = value
-        # Update group membership
         for group in self._groups.values():
             if esc_id in group.esc_ids and group.name != (update.group or group.name):
                 group.esc_ids = [e for e in group.esc_ids if e != esc_id]
@@ -867,27 +1102,97 @@ class DmTuiApp(App[None]):
         self._persist_config()
         self._log(f"Group '{definition.name}' updated ({len(unique_ids)} motors).")
 
-    def _reapply_filters(self) -> None:
+    def _handle_demo_selection(self, selection: Optional[tuple[str, str]]) -> None:
+        if selection is None:
+            return
+        demo_key, group_name = selection
+        definition = next((demo for demo in DEMO_DEFINITIONS if demo.key == demo_key), None)
+        if definition is None:
+            self._log(f"[red]Demo '{demo_key}' not found.[/red]")
+            return
+        if group_name == "ALL":
+            esc_ids = sorted(set(self._motor_records.keys()) | set(self._motors.keys()))
+            if not esc_ids:
+                self._log("No motors available to run demo.")
+                return
+        else:
+            group = self._groups.get(group_name)
+            if not group or not group.esc_ids:
+                self._log(f"Group '{group_name}' is empty.")
+                return
+            esc_ids = list(group.esc_ids)
+        self._start_demo(definition, esc_ids, group_name)
+
+    def _start_demo(self, definition: DemoDefinition, esc_ids: list[int], label: str) -> None:
         if not self._bus_manager:
+            self._log("[red]Cannot start demo; bus offline.[/red]")
             return
-        mst_ids = [record.mst_id for record in self._motor_records.values() if record.mst_id]
-        if not mst_ids:
+        self._stop_demo(disable=False)
+        self._active_demo = ActiveDemo(definition=definition, esc_ids=esc_ids, start_time=monotonic())
+        self._demo_timer = self.set_interval(0.05, self._demo_tick)
+        self._log(f"Starting demo '{definition.title}' using {label} ({len(esc_ids)} motors).")
+
+    def _demo_tick(self) -> None:  # pragma: no cover - timing sensitive
+        if not self._bus_manager or not self._active_demo:
+            self._stop_demo(disable=False)
             return
+        demo = self._active_demo
+        t = monotonic() - demo.start_time
         try:
-            self._bus_manager.set_filters(protocol.build_filters(mst_ids))
-        except BusManagerError as exc:  # pragma: no cover
-            self._log(f"[yellow]Warning:[/yellow] failed to apply filters: {exc}")
+            targets = [
+                MotorTarget(
+                    esc_id=esc,
+                    velocity_rad_s=self._compute_demo_velocity(demo.definition, t, index, len(demo.esc_ids)),
+                )
+                for index, esc in enumerate(demo.esc_ids)
+            ]
+            command_velocities(self._bus_manager, targets)
+        except BusManagerError as exc:
+            self.call_from_thread(self._log, f"[red]Demo halted due to bus error:[/red] {exc}")
+            self.call_from_thread(self._stop_demo, True)
 
-    def _cleanup_empty_groups(self) -> None:
-        empty = [name for name, group in self._groups.items() if not group.esc_ids]
-        for name in empty:
-            del self._groups[name]
+    def _stop_demo(self, disable: bool) -> None:
+        if self._demo_timer is not None:
+            self._demo_timer.stop()
+            self._demo_timer = None
+        if not self._active_demo:
+            return
+        demo = self._active_demo
+        self._active_demo = None
+        if self._bus_manager:
+            try:
+                if disable:
+                    disable_all(self._bus_manager, demo.esc_ids)
+                else:
+                    targets = [MotorTarget(esc_id=esc, velocity_rad_s=0.0) for esc in demo.esc_ids]
+                    command_velocities(self._bus_manager, targets)
+            except BusManagerError:
+                pass
+        if disable:
+            self._log("Demo stopped and motors disabled.")
+        else:
+            self._log("Demo stopped.")
 
-    def _require_selected_motor(self) -> Optional[int]:
-        if self.selected_esc is None:
-            self._log("Select a motor row first.")
-            return None
-        return self.selected_esc
+    def _compute_demo_velocity(
+        self,
+        definition: DemoDefinition,
+        t: float,
+        index: int,
+        count: int,
+    ) -> float:
+        phase_base = 2 * math.pi * definition.frequency_hz * t
+        if count <= 1:
+            return definition.amplitude_rps * math.sin(phase_base)
+        if definition.mode == "sine":
+            phase = phase_base + (2 * math.pi * index / count)
+            return definition.amplitude_rps * math.sin(phase)
+        if definition.mode == "antiphase":
+            phase = phase_base + (math.pi if index % 2 else 0)
+            return definition.amplitude_rps * math.sin(phase)
+        if definition.mode == "figure8":
+            phase = phase_base + (index * math.pi / 2)
+            return definition.amplitude_rps * math.sin(phase)
+        return definition.amplitude_rps * math.sin(phase_base)
 
     def _schedule_discovery(self, *, force_active: bool = False) -> None:
         if not self._mounted or self._bus_manager is None:
@@ -896,8 +1201,7 @@ class DmTuiApp(App[None]):
             if self._discovery_running:
                 return
             self._discovery_running = True
-        thread = threading.Thread(target=self._discovery_worker, args=(force_active,), daemon=True)
-        thread.start()
+        threading.Thread(target=self._discovery_worker, args=(force_active,), daemon=True).start()
 
     def _schedule_bus_stats_refresh(self) -> None:
         if not self._mounted:
@@ -915,8 +1219,7 @@ class DmTuiApp(App[None]):
                 return
             motors = passive_sniff(bus, duration=0.6)
             if (not motors or force_active) and bus is not None:
-                active = active_probe(bus)
-                motors.extend(active)
+                motors.extend(active_probe(bus))
         except Exception as exc:  # pragma: no cover - hardware dependent
             self.call_from_thread(self._log, f"[red]Discovery error:[/red] {exc}")
         else:
@@ -1033,13 +1336,13 @@ class DmTuiApp(App[None]):
         panel = self.query_one(TelemetryPanel)
         panel.update_rows(self._telemetry, monotonic())
 
-    def _refresh_hint_panel(self) -> None:
-        panel = self.query_one(HintPanel)
-        panel.update_hints(self.active_bus, self.selected_esc)
-
     def _refresh_group_panel(self) -> None:
         panel = self.query_one(GroupPanel)
         panel.update_groups(self._groups)
+
+    def _refresh_hint_panel(self) -> None:
+        panel = self.query_one(HintPanel)
+        panel.update_hints(self.active_bus, self.selected_esc)
 
     def _open_bus(self, channel: str) -> None:
         self._close_bus()
@@ -1073,7 +1376,7 @@ class DmTuiApp(App[None]):
         self._cleanup_empty_groups()
         self._config.groups = [
             GroupRecord(name=name, esc_ids=sorted(set(record.esc_ids)))
-            for name, record in self._groups.items()
+            for name, record in sorted(self._groups.items())
         ]
         save_config(self._config, self._config_path)
 
@@ -1110,6 +1413,22 @@ class DmTuiApp(App[None]):
         t_max = float(metadata.get("t_max", metadata.get("T_MAX", DEFAULT_T_MAX)))
         return p_max, v_max, t_max
 
+    def _reapply_filters(self) -> None:
+        if not self._bus_manager:
+            return
+        mst_ids = [record.mst_id for record in self._motor_records.values() if record.mst_id]
+        if not mst_ids:
+            return
+        try:
+            self._bus_manager.set_filters(protocol.build_filters(mst_ids))
+        except BusManagerError as exc:  # pragma: no cover
+            self._log(f"[yellow]Warning:[/yellow] failed to apply filters: {exc}")
+
+    def _cleanup_empty_groups(self) -> None:
+        empty = [name for name, group in self._groups.items() if not group.esc_ids]
+        for name in empty:
+            del self._groups[name]
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.sender.id != "motor-table":
             return
@@ -1118,6 +1437,10 @@ class DmTuiApp(App[None]):
         except (TypeError, ValueError):
             return
         self.selected_esc = esc_id
+
+    def action_manage_groups(self) -> None:
+        modal = GroupModal(self._groups)
+        self.push_screen(modal, callback=self._apply_group_definition)
 
 
 def run(config_path: Path | None = None) -> None:
