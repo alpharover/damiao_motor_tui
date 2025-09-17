@@ -78,9 +78,12 @@ sudo ifconfig canB txqueuelen 65536
 ### Testing Strategy
 - Unit tests on protocol packers, MIT bit packing, and feedback decoding using `vcan`.
 - Loopback smoke tests with `cangen`/`candump` to confirm filters and reader behavior.
-- Hardware validation checklist: ±30/40 rpm sweeps, synchronized braking, MIT mode responsiveness.
+- Hardware validation checklist covering ±30/40 rpm sweeps, braking, and MIT responsiveness—see [`docs/HARDWARE_VALIDATION.md`](docs/HARDWARE_VALIDATION.md).
 
 See [`docs/TESTING.md`](docs/TESTING.md) for step-by-step commands, including a `vcan` loopback recipe.
+
+## Hardware Validation
+After completing the software checks in [`docs/TESTING.md`](docs/TESTING.md), run the bench procedures in [`docs/HARDWARE_VALIDATION.md`](docs/HARDWARE_VALIDATION.md) to confirm safe motion before demos. The guide covers the ±30/40 rpm velocity sweeps, braking confidence drills, and the MIT “taste test” mentioned in the roadmap.
 
 ## Safety Considerations
 - All command frames must be 8 bytes—drives ignore shorter DLC values.
