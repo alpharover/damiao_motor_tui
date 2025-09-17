@@ -21,6 +21,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.command import Command, DiscoveryHit
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Log, Sparkline, Static
+from textual.css.query import NoMatches
 
 from .bus_manager import BusManager, BusManagerError
 from .controllers import (
