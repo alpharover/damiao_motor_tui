@@ -21,7 +21,7 @@ from textual.timer import Timer
 from textual.command import Command, DiscoveryHit
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Log, Sparkline, Static
 
-from .bus_manager import BusManager, BusManagerError, PeriodicTask
+from .bus_manager import BusManager, BusManagerError
 from .controllers import (
     MotorTarget,
     assign_motor_ids,
@@ -36,6 +36,7 @@ from .controllers import (
 from .dmlib import protocol
 from .dmlib.protocol import Feedback
 from .discovery import MotorInfo, active_probe, passive_sniff
+from .demos import DemoHandle, brake_to_zero, sine_orchestra
 from .persistence import (
     AppConfig,
     GroupRecord,
@@ -106,7 +107,7 @@ class DemoDefinition:
 class ActiveDemo:
     definition: DemoDefinition
     esc_ids: list[int]
-    start_time: float
+    handle: DemoHandle | None
 
 
 DEMO_DEFINITIONS: list[DemoDefinition] = [
@@ -805,10 +806,7 @@ class DmTuiApp(App[None]):
         self._bus_manager: BusManager | None = None
         self._bus_stats_timer: Timer | None = None
         self._discovery_timer: Timer | None = None
-        self._demo_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
-        self._demo_tasks: list[PeriodicTask] = []
-        self._demo_uses_periodic = False
         self._discovery_running = False
         self._bus_stats_running = False
         self.active_bus = self._config.active_bus
@@ -1180,117 +1178,42 @@ class DmTuiApp(App[None]):
             self._log("[red]Cannot start demo; bus offline.[/red]")
             return
         self._stop_demo(disable=False)
-        self._active_demo = ActiveDemo(definition=definition, esc_ids=esc_ids, start_time=monotonic())
-        self._demo_tasks = []
-        self._demo_uses_periodic = False
-        period_hz = max(20.0, definition.frequency_hz * 16.0)
-        fallback_required = False
-        for esc in esc_ids:
-            arb_id, payload = protocol.frame_speed(esc, 0.0)
-            try:
-                task = self._bus_manager.send_periodic(arb_id, payload, hz=period_hz)
-            except BusManagerError as exc:
-                self._log(
-                    f"[yellow]Periodic scheduling unavailable for ESC 0x{esc:02X}; falling back to direct sends.[/yellow] ({exc})"
-                )
-                for handle in self._demo_tasks:
-                    try:
-                        handle.stop()
-                    except Exception:
-                        pass
-                self._demo_tasks.clear()
-                fallback_required = True
-                break
-            else:
-                self._demo_tasks.append(task)
-        if self._demo_tasks:
-            self._demo_uses_periodic = True
-        elif fallback_required:
-            self._log("Using timer-driven commands for demo execution.")
-        self._demo_timer = self.set_interval(0.05, self._demo_tick)
+        try:
+            handle = sine_orchestra(
+                self._bus_manager,
+                esc_ids,
+                amplitude_rps=definition.amplitude_rps,
+                frequency_hz=definition.frequency_hz,
+                mode=definition.mode,
+            )
+        except (BusManagerError, ValueError) as exc:
+            self._log(f"[red]Failed to start demo:[/red] {exc}")
+            return
+        self._active_demo = ActiveDemo(definition=definition, esc_ids=list(esc_ids), handle=handle)
         self._log(f"Starting demo '{definition.title}' using {label} ({len(esc_ids)} motors).")
 
-    def _demo_tick(self) -> None:  # pragma: no cover - timing sensitive
-        if not self._bus_manager or not self._active_demo:
-            self._stop_demo(disable=False)
-            return
-        demo = self._active_demo
-        t = monotonic() - demo.start_time
-        count = len(demo.esc_ids)
-        velocities = [
-            self._compute_demo_velocity(demo.definition, t, index, count)
-            for index, _ in enumerate(demo.esc_ids)
-        ]
-        if self._demo_tasks:
-            for index, esc_id in enumerate(demo.esc_ids):
-                _, payload = protocol.frame_speed(esc_id, velocities[index])
-                try:
-                    self._demo_tasks[index].update(data=payload)
-                except Exception as exc:
-                    self.call_from_thread(self._log, f"[red]Demo halted:[/red] {exc}")
-                    self.call_from_thread(self._stop_demo, True)
-                    break
-        else:
-            targets = [
-                MotorTarget(esc_id=esc, velocity_rad_s=vel)
-                for esc, vel in zip(demo.esc_ids, velocities)
-            ]
-            try:
-                command_velocities(self._bus_manager, targets)
-            except BusManagerError as exc:
-                self.call_from_thread(self._log, f"[red]Demo halted (send error):[/red] {exc}")
-                self.call_from_thread(self._stop_demo, True)
-
     def _stop_demo(self, disable: bool) -> None:
-        if self._demo_timer is not None:
-            self._demo_timer.stop()
-            self._demo_timer = None
-        if self._demo_tasks:
-            for task in list(self._demo_tasks):
-                try:
-                    task.stop()
-                except Exception:
-                    pass
-            self._demo_tasks.clear()
-        self._demo_uses_periodic = False
         if not self._active_demo:
             return
         demo = self._active_demo
         self._active_demo = None
+        if demo.handle is not None:
+            try:
+                demo.handle.stop()
+            except Exception:
+                pass
         if self._bus_manager:
             try:
                 if disable:
                     disable_all(self._bus_manager, demo.esc_ids)
                 else:
-                    targets = [MotorTarget(esc_id=esc, velocity_rad_s=0.0) for esc in demo.esc_ids]
-                    command_velocities(self._bus_manager, targets)
+                    brake_to_zero(self._bus_manager, demo.esc_ids)
             except BusManagerError:
                 pass
         if disable:
             self._log("Demo stopped and motors disabled.")
         else:
             self._log("Demo stopped.")
-
-    def _compute_demo_velocity(
-        self,
-        definition: DemoDefinition,
-        t: float,
-        index: int,
-        count: int,
-    ) -> float:
-        phase_base = 2 * math.pi * definition.frequency_hz * t
-        if count <= 1:
-            return definition.amplitude_rps * math.sin(phase_base)
-        if definition.mode == "sine":
-            phase = phase_base + (2 * math.pi * index / count)
-            return definition.amplitude_rps * math.sin(phase)
-        if definition.mode == "antiphase":
-            phase = phase_base + (math.pi if index % 2 else 0)
-            return definition.amplitude_rps * math.sin(phase)
-        if definition.mode == "figure8":
-            phase = phase_base + (index * math.pi / 2)
-            return definition.amplitude_rps * math.sin(phase)
-        return definition.amplitude_rps * math.sin(phase_base)
 
     def _schedule_discovery(self, *, force_active: bool = False) -> None:
         if not self._mounted or self._bus_manager is None:
