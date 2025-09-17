@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dm-tui"
+version = "0.1.0"
+description = "Textual TUI for Damiao motors on Raspberry Pi SocketCAN"
+authors = [{name = "alpharover"}]
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+dependencies = [
+    "textual>=0.54",
+    "python-can>=4.3",
+    "pyyaml>=6.0",
+    "rich>=13.7"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["dm_tui"]
+ignore_missing_imports = true

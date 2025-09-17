@@ -67,6 +67,8 @@ sudo ifconfig canB txqueuelen 65536
 - Loopback smoke tests with `cangen`/`candump` to confirm filters and reader behavior.
 - Hardware validation checklist: ±30/40 rpm sweeps, synchronized braking, MIT mode responsiveness.
 
+See [`docs/TESTING.md`](docs/TESTING.md) for step-by-step commands, including a `vcan` loopback recipe.
+
 ## Safety Considerations
 - All command frames must be 8 bytes—drives ignore shorter DLC values.
 - Always set `CTRL_MODE=3` before issuing velocity commands.
