@@ -808,6 +808,7 @@ class DmTuiApp(App[None]):
         self._demo_timer: Timer | None = None
         self._active_demo: ActiveDemo | None = None
         self._demo_tasks: list[PeriodicTask] = []
+        self._demo_uses_periodic = False
         self._discovery_running = False
         self._bus_stats_running = False
         self.active_bus = self._config.active_bus
@@ -1181,40 +1182,64 @@ class DmTuiApp(App[None]):
         self._stop_demo(disable=False)
         self._active_demo = ActiveDemo(definition=definition, esc_ids=esc_ids, start_time=monotonic())
         self._demo_tasks = []
+        self._demo_uses_periodic = False
         period_hz = max(20.0, definition.frequency_hz * 16.0)
+        fallback_required = False
         for esc in esc_ids:
             arb_id, payload = protocol.frame_speed(esc, 0.0)
             try:
                 task = self._bus_manager.send_periodic(arb_id, payload, hz=period_hz)
             except BusManagerError as exc:
-                self._log(f"[red]Failed to start demo for ESC 0x{esc:02X}:[/red] {exc}")
+                self._log(
+                    f"[yellow]Periodic scheduling unavailable for ESC 0x{esc:02X}; falling back to direct sends.[/yellow] ({exc})"
+                )
                 for handle in self._demo_tasks:
                     try:
                         handle.stop()
                     except Exception:
                         pass
                 self._demo_tasks.clear()
-                return
-            self._demo_tasks.append(task)
+                fallback_required = True
+                break
+            else:
+                self._demo_tasks.append(task)
+        if self._demo_tasks:
+            self._demo_uses_periodic = True
+        elif fallback_required:
+            self._log("Using timer-driven commands for demo execution.")
         self._demo_timer = self.set_interval(0.05, self._demo_tick)
         self._log(f"Starting demo '{definition.title}' using {label} ({len(esc_ids)} motors).")
 
     def _demo_tick(self) -> None:  # pragma: no cover - timing sensitive
-        if not self._bus_manager or not self._active_demo or not self._demo_tasks:
+        if not self._bus_manager or not self._active_demo:
             self._stop_demo(disable=False)
             return
         demo = self._active_demo
         t = monotonic() - demo.start_time
         count = len(demo.esc_ids)
-        for index, esc_id in enumerate(demo.esc_ids):
-            velocity = self._compute_demo_velocity(demo.definition, t, index, count)
-            _, payload = protocol.frame_speed(esc_id, velocity)
+        velocities = [
+            self._compute_demo_velocity(demo.definition, t, index, count)
+            for index, _ in enumerate(demo.esc_ids)
+        ]
+        if self._demo_tasks:
+            for index, esc_id in enumerate(demo.esc_ids):
+                _, payload = protocol.frame_speed(esc_id, velocities[index])
+                try:
+                    self._demo_tasks[index].update(data=payload)
+                except Exception as exc:
+                    self.call_from_thread(self._log, f"[red]Demo halted:[/red] {exc}")
+                    self.call_from_thread(self._stop_demo, True)
+                    break
+        else:
+            targets = [
+                MotorTarget(esc_id=esc, velocity_rad_s=vel)
+                for esc, vel in zip(demo.esc_ids, velocities)
+            ]
             try:
-                self._demo_tasks[index].update(data=payload)
-            except Exception as exc:
-                self.call_from_thread(self._log, f"[red]Demo halted:[/red] {exc}")
+                command_velocities(self._bus_manager, targets)
+            except BusManagerError as exc:
+                self.call_from_thread(self._log, f"[red]Demo halted (send error):[/red] {exc}")
                 self.call_from_thread(self._stop_demo, True)
-                break
 
     def _stop_demo(self, disable: bool) -> None:
         if self._demo_timer is not None:
@@ -1227,6 +1252,7 @@ class DmTuiApp(App[None]):
                 except Exception:
                     pass
             self._demo_tasks.clear()
+        self._demo_uses_periodic = False
         if not self._active_demo:
             return
         demo = self._active_demo
