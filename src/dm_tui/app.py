@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Deque, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Deque, Dict, Iterable, Optional
 
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.events import Mount
@@ -41,11 +41,15 @@ from .persistence import (
     AppConfig,
     GroupRecord,
     MotorRecord,
+    DEFAULT_CONFIG_DIR,
     ensure_bus,
     load_config,
     save_config,
 )
 from .osutils import read_bus_statistics
+
+if TYPE_CHECKING:
+    from .logging import TelemetryCsvWriter
 
 DEFAULT_P_MAX = 12.0
 DEFAULT_V_MAX = 30.0
@@ -799,6 +803,10 @@ class DmTuiApp(App[None]):
         self._telemetry_history: Dict[int, Deque[float]] = {}
         self._torque_history: Dict[int, Deque[float]] = {}
         self._temp_history: Dict[int, Deque[int]] = {}
+        config_dir = config_path.expanduser().parent if config_path is not None else DEFAULT_CONFIG_DIR
+        self._telemetry_log_path = config_dir / "telemetry.csv"
+        self._telemetry_log_writer: "TelemetryCsvWriter | None" = None
+        self._telemetry_log_error = False
         self._groups: Dict[str, GroupRecord] = {
             group.name: GroupRecord(name=group.name, esc_ids=list(group.esc_ids))
             for group in self._config.groups
@@ -843,6 +851,7 @@ class DmTuiApp(App[None]):
             self._discovery_timer.stop()
         self._stop_demo(disable=False)
         self._close_bus()
+        self._close_telemetry_log()
         self._mounted = False
 
     def watch_active_bus(self, active_bus: str) -> None:
@@ -1300,6 +1309,20 @@ class DmTuiApp(App[None]):
             torque_nm=engineering.torque_nm,
         )
         self._telemetry[esc_id] = telemetry_record
+        writer = self._ensure_telemetry_log()
+        if writer is not None:
+            try:
+                from . import logging as telemetry_logging
+
+                row = telemetry_logging.telemetry_row_from_engineering(
+                    engineering,
+                    mst_id=mst_id,
+                    timestamp=timestamp,
+                )
+                writer.write_row(row)
+            except Exception as exc:  # pragma: no cover - depends on filesystem
+                self._log(f"[red]Telemetry log write failed:[/red] {exc}")
+                self._close_telemetry_log(mark_error=True)
         velocity_history = self._telemetry_history.setdefault(esc_id, deque(maxlen=200))
         velocity_history.append(engineering.velocity_rad_s)
         torque_history = self._torque_history.setdefault(esc_id, deque(maxlen=200))
@@ -1320,11 +1343,12 @@ class DmTuiApp(App[None]):
             config_changed = True
         if self.selected_esc is None:
             self.selected_esc = esc_id
-        self._refresh_motor_table()
-        self._refresh_telemetry_panel()
-        self._refresh_detail_panel()
-        self._refresh_velocity_sparkline()
-        self._reapply_filters()
+        if self._mounted:
+            self._refresh_motor_table()
+            self._refresh_telemetry_panel()
+            self._refresh_detail_panel()
+            self._refresh_velocity_sparkline()
+            self._reapply_filters()
         if config_changed:
             self._persist_config()
 
@@ -1410,6 +1434,35 @@ class DmTuiApp(App[None]):
             self._bus_manager.close()
             self._bus_manager = None
 
+    def _ensure_telemetry_log(self) -> "TelemetryCsvWriter | None":
+        if self._telemetry_log_writer is not None:
+            return self._telemetry_log_writer
+        if self._telemetry_log_error:
+            return None
+        try:
+            from . import logging as telemetry_logging
+
+            self._telemetry_log_writer = telemetry_logging.open_csv(self._telemetry_log_path)
+        except Exception as exc:  # pragma: no cover - filesystem/permissions dependent
+            self._telemetry_log_error = True
+            self._log(f"[red]Telemetry log unavailable:[/red] {exc}")
+            self._telemetry_log_writer = None
+        return self._telemetry_log_writer
+
+    def _close_telemetry_log(self, *, mark_error: bool = False) -> None:
+        writer = self._telemetry_log_writer
+        if writer is None:
+            return
+        self._telemetry_log_writer = None
+        try:
+            writer.close()
+        except Exception as exc:  # pragma: no cover - depends on filesystem
+            self._log(f"[red]Telemetry log close failed:[/red] {exc}")
+            self._telemetry_log_error = True
+        else:
+            if mark_error:
+                self._telemetry_log_error = True
+
     def _persist_config(self) -> None:
         self._config.motors = list(self._motor_records.values())
         self._config.active_bus = self.active_bus
@@ -1425,7 +1478,7 @@ class DmTuiApp(App[None]):
         text = f"[{timestamp}] {message}"
         try:
             log = self.query_one(ActivityLog)
-        except LookupError:
+        except (LookupError, ScreenStackError):
             pass
         else:
             log.write_line(text)
