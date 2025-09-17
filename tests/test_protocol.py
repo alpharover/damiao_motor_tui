@@ -1,3 +1,5 @@
+import pytest
+
 from dm_tui.dmlib import protocol
 
 
@@ -41,3 +43,56 @@ def test_frame_builders_have_correct_length():
     assert len(speed_data) == 8
     _, pos_speed_data = protocol.frame_position_speed(1, 1.0, 2.0)
     assert len(pos_speed_data) == 8
+
+
+def test_frame_mit_round_trip_preserves_values():
+    limits = dict(
+        position_limit=5.0,
+        velocity_limit=8.0,
+        torque_limit=6.0,
+        kp_limit=250.0,
+        kd_limit=12.0,
+    )
+    arb_id, payload = protocol.frame_mit(
+        0x05,
+        position_rad=1.25,
+        velocity_rad_s=-2.4,
+        torque_nm=1.9,
+        kp=120.0,
+        kd=3.5,
+        **limits,
+    )
+    assert arb_id == 0x305
+    assert len(payload) == 8
+    position, velocity, torque, kp, kd = protocol.decode_mit(payload, **limits)
+    assert position == pytest.approx(1.25, rel=1e-2, abs=1e-3)
+    assert velocity == pytest.approx(-2.4, rel=1e-2, abs=1e-3)
+    assert torque == pytest.approx(1.9, rel=1e-2, abs=1e-3)
+    assert kp == pytest.approx(120.0, rel=1e-2, abs=1e-3)
+    assert kd == pytest.approx(3.5, rel=1e-2, abs=1e-3)
+
+
+def test_frame_mit_clamps_out_of_range_inputs():
+    limits = dict(
+        position_limit=2.0,
+        velocity_limit=4.0,
+        torque_limit=3.0,
+        kp_limit=150.0,
+        kd_limit=6.0,
+    )
+    _, payload = protocol.frame_mit(
+        0x01,
+        position_rad=10.0,
+        velocity_rad_s=-10.0,
+        torque_nm=10.0,
+        kp=400.0,
+        kd=20.0,
+        **limits,
+    )
+    position, velocity, torque, kp, kd = protocol.decode_mit(payload, **limits)
+    assert position <= limits["position_limit"] + 1e-6
+    assert position >= -limits["position_limit"] - 1e-6
+    assert velocity == pytest.approx(-limits["velocity_limit"], abs=1e-3)
+    assert torque == pytest.approx(limits["torque_limit"], abs=1e-3)
+    assert kp == pytest.approx(limits["kp_limit"], abs=1e-3)
+    assert kd == pytest.approx(limits["kd_limit"], abs=1e-3)
