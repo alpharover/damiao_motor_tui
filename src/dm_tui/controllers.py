@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from .bus_manager import BusManager
 from .dmlib import protocol
@@ -15,19 +15,36 @@ class MotorTarget:
     velocity_rad_s: float = 0.0
 
 
+def enable(bus: BusManager, esc_id: int) -> None:
+    arb_id, data = protocol.frame_enable(esc_id)
+    bus.send(arb_id, data)
+
+
+def disable(bus: BusManager, esc_id: int) -> None:
+    arb_id, data = protocol.frame_disable(esc_id)
+    bus.send(arb_id, data)
+
+
+def zero(bus: BusManager, esc_id: int) -> None:
+    arb_id, data = protocol.frame_zero(esc_id)
+    bus.send(arb_id, data)
+
+
 def enable_all(bus: BusManager, esc_ids: Iterable[int]) -> None:
     for esc_id in esc_ids:
-        arb_id, data = protocol.frame_enable(esc_id)
-        bus.send(arb_id, data)
+        enable(bus, esc_id)
 
 
 def disable_all(bus: BusManager, esc_ids: Iterable[int]) -> None:
     for esc_id in esc_ids:
-        arb_id, data = protocol.frame_disable(esc_id)
-        bus.send(arb_id, data)
+        disable(bus, esc_id)
 
 
 def command_velocities(bus: BusManager, targets: Iterable[MotorTarget]) -> None:
     for target in targets:
         arb_id, data = protocol.frame_speed(target.esc_id, target.velocity_rad_s)
         bus.send(arb_id, data)
+
+
+def command_velocity(bus: BusManager, esc_id: int, velocity_rad_s: float) -> None:
+    command_velocities(bus, [MotorTarget(esc_id=esc_id, velocity_rad_s=velocity_rad_s)])

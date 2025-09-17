@@ -39,6 +39,14 @@ Welcome to the **dm-tui** project. This guide orients any agent working on the R
 4. **Testing** – maintain unit tests for protocol packers, discovery logic, and persistence. Confirm on hardware for anything that touches motion.
 5. **Git Hygiene** – feature branches preferred. Use the repo’s SSH remote (`git@github.com:alpharover/damiao_motor_tui.git`).
 
+### Current TUI Key Bindings
+- `Space`: global E-STOP
+- `R`: passive + active discovery sweep
+- `B`: cycle between configured CAN buses
+- `E` / `D` / `Z`: enable, disable, or zero the highlighted motor
+- `V`: prompt for a velocity command (rad/s) for the highlighted motor
+- `Ctrl+S`: persist configuration to disk
+
 ## Useful Utilities
 - `python-can`, `can-utils` (`candump`, `cansend`) for debugging.
 - Existing helper script: `/home/alpha_pi5/dm_id_tool.py` (legacy ID management).

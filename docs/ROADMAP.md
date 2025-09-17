@@ -13,10 +13,10 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 ## Milestones
 
 ### Milestone 1 – Environment Foundations (Week 1)
-- [ ] Initialize Python project structure with Textual + python-can dependencies.
-- [ ] Implement BusManager abstraction (open/close bus, filters, periodic send, notifier hookup).
-- [ ] Provide configuration file loading/saving (YAML/TOML) for channel defaults and motor registry.
-- [ ] Validate SocketCAN interactions using `vcan` loopback tests.
+- [x] Initialize Python project structure with Textual + python-can dependencies.
+- [x] Implement BusManager abstraction (open/close bus, filters, periodic send, notifier hookup).
+- [x] Provide configuration file loading/saving (YAML/TOML) for channel defaults and motor registry.
+- [x] Validate SocketCAN interactions using `vcan` loopback tests.
 
 ### Milestone 2 – Protocol & Safety Core (Week 2)
 - [ ] Implement frame pack/unpack utilities for enable/disable/zero, speed, position-speed, and MIT.
@@ -25,14 +25,14 @@ Deliver a headless Textual-based terminal UI ("dm-tui") that discovers, configur
 - [ ] Integrate global E-STOP and watchdog (highlight stale feedback, auto-disable if needed).
 
 ### Milestone 3 – Discovery & Configuration UX (Week 3)
-- [ ] Passive sniff logic recognizing motors by feedback signature.
-- [ ] Gentle active probe (0 rad/s) workflow to locate quiet motors.
+- [x] Passive sniff logic recognizing motors by feedback signature.
+- [x] Gentle active probe (0 rad/s) workflow to locate quiet motors.
 - [ ] ID assignment wizard writing RIDs 7/8/10 safely, persisting via SAVE (0xAA).
 - [ ] Motor registry management (names, group tags, metadata) in persistence layer.
 
 ### Milestone 4 – Monitoring & Control Screens (Week 4)
-- [ ] Textual screen for bus health (bitrate, error counters, txqueuelen guidance).
-- [ ] Live monitor panel with trendlines/metrics for position, velocity, torque, temps.
+- [x] Textual screen for bus health (bitrate, error counters, txqueuelen guidance).
+- [x] Live monitor panel with trendlines/metrics for position, velocity, torque, temps.
 - [ ] Control screen with per-motor enable/disable, zero, velocity and MIT controls.
 - [ ] Group command support and command palette bindings (`Space`, `e`, `d`, `r`, `g`).
 
