@@ -1,5 +1,8 @@
 from dm_tui.controllers import (
+    MitTarget,
     assign_motor_ids,
+    command_mit,
+    command_mit_targets,
     command_velocity,
     disable,
     enable,
@@ -35,6 +38,39 @@ def test_command_velocity_targets_correct_arbitration_id():
     arb_id, data = bus.sent[0]
     assert arb_id == 0x200 + 3
     assert len(data) == 8
+
+
+def test_command_mit_targets_correct_arbitration_id():
+    bus = FakeBus()
+    command_mit(
+        bus,
+        3,
+        position_rad=0.5,
+        velocity_rad_s=-0.2,
+        torque_nm=0.8,
+        kp=60.0,
+        kd=2.0,
+        position_limit=2.0,
+        velocity_limit=4.0,
+        torque_limit=3.0,
+        kp_limit=200.0,
+        kd_limit=8.0,
+    )
+    arb_id, data = bus.sent[0]
+    assert arb_id == 0x300 + 3
+    assert len(data) == 8
+
+
+def test_command_mit_targets_iterates_collection():
+    bus = FakeBus()
+    targets = [
+        MitTarget(esc_id=1, position_rad=0.1, velocity_rad_s=0.0, torque_nm=0.0, kp=10.0, kd=1.0),
+        MitTarget(esc_id=2, position_rad=-0.1, velocity_rad_s=0.2, torque_nm=0.1, kp=12.0, kd=1.2),
+    ]
+    command_mit_targets(bus, targets)
+    assert len(bus.sent) == 2
+    assert bus.sent[0][0] == 0x301
+    assert bus.sent[1][0] == 0x302
 
 
 def test_write_param_targets_management_id():

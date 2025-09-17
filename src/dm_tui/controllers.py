@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable
 
 from .bus_manager import BusManager
 from .dmlib import protocol
@@ -14,6 +14,21 @@ from .dmlib.params import RID_CTRL_MODE, RID_ESC_ID, RID_MST_ID
 class MotorTarget:
     esc_id: int
     velocity_rad_s: float = 0.0
+
+
+@dataclass(slots=True)
+class MitTarget:
+    esc_id: int
+    position_rad: float = 0.0
+    velocity_rad_s: float = 0.0
+    torque_nm: float = 0.0
+    kp: float = 0.0
+    kd: float = 0.0
+    position_limit: float = protocol.MIT_DEFAULT_POSITION_LIMIT
+    velocity_limit: float = protocol.MIT_DEFAULT_VELOCITY_LIMIT
+    torque_limit: float = protocol.MIT_DEFAULT_TORQUE_LIMIT
+    kp_limit: float = protocol.MIT_DEFAULT_KP_LIMIT
+    kd_limit: float = protocol.MIT_DEFAULT_KD_LIMIT
 
 
 def enable(bus: BusManager, esc_id: int) -> None:
@@ -49,6 +64,59 @@ def command_velocities(bus: BusManager, targets: Iterable[MotorTarget]) -> None:
 
 def command_velocity(bus: BusManager, esc_id: int, velocity_rad_s: float) -> None:
     command_velocities(bus, [MotorTarget(esc_id=esc_id, velocity_rad_s=velocity_rad_s)])
+
+
+def command_mit(
+    bus: BusManager,
+    esc_id: int,
+    *,
+    position_rad: float,
+    velocity_rad_s: float,
+    torque_nm: float,
+    kp: float,
+    kd: float,
+    position_limit: float = protocol.MIT_DEFAULT_POSITION_LIMIT,
+    velocity_limit: float = protocol.MIT_DEFAULT_VELOCITY_LIMIT,
+    torque_limit: float = protocol.MIT_DEFAULT_TORQUE_LIMIT,
+    kp_limit: float = protocol.MIT_DEFAULT_KP_LIMIT,
+    kd_limit: float = protocol.MIT_DEFAULT_KD_LIMIT,
+) -> None:
+    command_mit_targets(
+        bus,
+        [
+            MitTarget(
+                esc_id=esc_id,
+                position_rad=position_rad,
+                velocity_rad_s=velocity_rad_s,
+                torque_nm=torque_nm,
+                kp=kp,
+                kd=kd,
+                position_limit=position_limit,
+                velocity_limit=velocity_limit,
+                torque_limit=torque_limit,
+                kp_limit=kp_limit,
+                kd_limit=kd_limit,
+            )
+        ],
+    )
+
+
+def command_mit_targets(bus: BusManager, targets: Iterable[MitTarget]) -> None:
+    for target in targets:
+        arb_id, data = protocol.frame_mit(
+            target.esc_id,
+            position_rad=target.position_rad,
+            velocity_rad_s=target.velocity_rad_s,
+            torque_nm=target.torque_nm,
+            kp=target.kp,
+            kd=target.kd,
+            position_limit=target.position_limit,
+            velocity_limit=target.velocity_limit,
+            torque_limit=target.torque_limit,
+            kp_limit=target.kp_limit,
+            kd_limit=target.kd_limit,
+        )
+        bus.send(arb_id, data)
 
 
 def write_param(bus: BusManager, esc_id: int, rid: int, value: int) -> None:
