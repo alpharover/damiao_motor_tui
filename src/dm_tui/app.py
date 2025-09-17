@@ -1146,6 +1146,7 @@ class DmTuiApp(App[None]):
         }
         self._limit_errors: set[int] = set()
         self._warned_esc_zero = False
+        self._last_probe_warning = 0.0
         self.active_bus = self._config.active_bus
 
     def compose(self) -> ComposeResult:
@@ -1730,10 +1731,13 @@ class DmTuiApp(App[None]):
                 try:
                     motors.extend(active_probe(bus))
                 except BusManagerError as exc:
-                    self.call_from_thread(
-                        self._log,
-                        f"[yellow]Discovery warning:[/yellow] active probe skipped ({exc}).",
-                    )
+                    now = monotonic()
+                    if now - self._last_probe_warning > 15.0:
+                        self._last_probe_warning = now
+                        self.call_from_thread(
+                            self._log,
+                            f"[yellow]Discovery warning:[/yellow] active probe skipped ({exc}).",
+                        )
         except Exception as exc:  # pragma: no cover - hardware dependent
             self.call_from_thread(self._log, f"[red]Discovery error:[/red] {exc}")
         else:
