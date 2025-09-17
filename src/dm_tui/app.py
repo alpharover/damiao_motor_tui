@@ -76,7 +76,6 @@ WATCHDOG_THRESHOLD_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_THRESHOLD", 3.0)
 WATCHDOG_COOLDOWN_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_COOLDOWN", 5.0)
 WATCHDOG_INTERVAL_SECONDS = _parse_env_float("DM_TUI_WATCHDOG_INTERVAL", 1.0)
 
-
 def _parse_optional_float(value: str) -> float | None:
     value = value.strip()
     if not value:

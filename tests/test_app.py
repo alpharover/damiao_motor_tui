@@ -2,6 +2,7 @@ from time import monotonic
 
 from rich.console import Console
 from textual.message_pump import active_app
+
 from dm_tui.app import DmTuiApp, MitCommand, MitModal, MotorTable
 from dm_tui.discovery import MotorInfo
 
@@ -69,7 +70,6 @@ def test_mit_modal_parses_user_values() -> None:
     assert result.torque_nm == 0.0  # blank falls back to default
     assert result.kp == 50.0
     assert result.kd == 2.5
-
 
 def test_watchdog_disables_stale_motor(monkeypatch, tmp_path) -> None:
     """Watchdog should disable stale motors and annotate state."""
