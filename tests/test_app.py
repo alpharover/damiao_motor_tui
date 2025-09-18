@@ -4,7 +4,14 @@ import pytest
 from rich.console import Console
 from textual.message_pump import active_app
 
-from dm_tui.app import DmTuiApp, MitCommand, MitModal, MotorControlPanel, MotorTable
+from dm_tui.app import (
+    DmTuiApp,
+    MetadataUpdate,
+    MitCommand,
+    MitModal,
+    MotorControlPanel,
+    MotorTable,
+)
 from dm_tui.discovery import MotorInfo
 from dm_tui.dmlib import params
 from dm_tui.dmlib.protocol import Feedback
@@ -168,6 +175,42 @@ def test_motor_control_panel_button_invokes_action() -> None:
         active_app.reset(token)
 
     assert stub.called == ["enable"]
+
+
+def test_metadata_update_refreshes_table(monkeypatch, tmp_path) -> None:
+    """Metadata edits should push updates to the motor table immediately."""
+
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    app._mounted = True
+    app._motors[0x01] = MotorInfo(0x01, 0x101, monotonic())
+
+    call_order: list[str] = []
+
+    def fake_group_refresh() -> None:
+        call_order.append("group")
+
+    def fake_detail_refresh() -> None:
+        call_order.append("detail")
+
+    def fake_persist() -> None:
+        call_order.append("persist")
+
+    def fake_table_refresh() -> None:
+        call_order.append("refresh")
+
+    app._refresh_group_panel = fake_group_refresh  # type: ignore[attr-defined]
+    app._refresh_detail_panel = fake_detail_refresh  # type: ignore[attr-defined]
+    app._persist_config = fake_persist  # type: ignore[attr-defined]
+    app._refresh_motor_table = fake_table_refresh  # type: ignore[attr-defined]
+    app._log = lambda _message: None
+
+    app._apply_metadata_update(
+        0x01,
+        MetadataUpdate(name="Left", group="G1", p_max=None, v_max=None, t_max=None),
+    )
+
+    assert "refresh" in call_order
+    assert call_order.index("refresh") > call_order.index("persist")
 
 
 def test_watchdog_disables_stale_motor(monkeypatch, tmp_path) -> None:

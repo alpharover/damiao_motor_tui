@@ -1572,6 +1572,8 @@ class DmTuiApp(App[None]):
         self._refresh_group_panel()
         self._refresh_detail_panel()
         self._persist_config()
+        if self._mounted:
+            self._refresh_motor_table()
         self._log(f"Updated metadata for ESC 0x{esc_id:02X}.")
 
     def _apply_group_definition(self, definition: Optional[GroupDefinition]) -> None:
