@@ -1,3 +1,4 @@
+import threading
 from time import monotonic
 
 import pytest
@@ -221,6 +222,49 @@ def test_watchdog_respects_cooldown(monkeypatch, tmp_path) -> None:
 
     assert calls == []
     assert 0x02 in app._watchdog_tripped
+
+
+def test_schedule_bus_stats_refresh_starts_single_worker(monkeypatch, tmp_path) -> None:
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    app._mounted = True
+    app._bus_stats_running = False
+
+    start_counter = 0
+    counter_lock = threading.Lock()
+
+    class DummyThread:
+        def __init__(self, *args, **kwargs) -> None:
+            self._target = kwargs.get("target")
+            if args:
+                self._target = args[0]
+
+        def start(self) -> None:
+            nonlocal start_counter
+            with counter_lock:
+                start_counter += 1
+
+    real_thread_cls = threading.Thread
+    monkeypatch.setattr("dm_tui.app.threading.Thread", DummyThread)
+
+    ready = threading.Barrier(3)
+    done = threading.Barrier(3)
+
+    def invoke() -> None:
+        ready.wait()
+        app._schedule_bus_stats_refresh()
+        done.wait()
+
+    workers = [real_thread_cls(target=invoke) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+
+    ready.wait()
+    done.wait()
+
+    for worker in workers:
+        worker.join()
+
+    assert start_counter == 1
 
 
 def test_get_commands_includes_motor_controls(tmp_path) -> None:

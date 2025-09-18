@@ -1662,7 +1662,7 @@ class DmTuiApp(App[None]):
         with self._threads_lock:
             if self._bus_stats_running:
                 return
-        self._bus_stats_running = True
+            self._bus_stats_running = True
         threading.Thread(target=self._bus_stats_worker, daemon=True).start()
 
     def _watchdog_check(self) -> None:
