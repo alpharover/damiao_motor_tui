@@ -128,3 +128,7 @@ def test_assign_motor_ids_sequences_commands():
     assign_motor_ids(bus, current_esc=1, new_esc=2, new_mst=0x12, control_mode=3)
     assert bus.sent[0][0] == 1  # disable current ESC
     assert bus.sent[-1][0] == 0x7FF
+    # save command should target the reassigned ESC ID
+    save_payload = bus.sent[-1][1]
+    assert save_payload[0] == 0x02
+    assert save_payload[1] == 0x00
