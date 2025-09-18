@@ -188,4 +188,4 @@ def assign_motor_ids(
     write_param(bus, current_esc, RID_ESC_ID, new_esc)
     write_param(bus, current_esc, RID_MST_ID, new_mst)
     write_param(bus, current_esc, RID_CTRL_MODE, control_mode)
-    save_params(bus, current_esc)
+    save_params(bus, new_esc)
