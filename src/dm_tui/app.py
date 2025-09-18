@@ -1936,8 +1936,12 @@ class DmTuiApp(App[None]):
 
     def _open_bus(self, channel: str) -> None:
         self._close_bus()
+        bus_config = next((bus for bus in self._config.buses if bus.channel == channel), None)
+        manager_kwargs: Dict[str, object] = {}
+        if bus_config is not None:
+            manager_kwargs["bitrate"] = bus_config.bitrate
         try:
-            manager = BusManager(channel=channel)
+            manager = BusManager(channel=channel, **manager_kwargs)
             manager.open()
         except BusManagerError as exc:
             self._bus_manager = None
