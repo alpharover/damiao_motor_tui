@@ -1,6 +1,8 @@
 import threading
 from time import monotonic
 
+from typing import Iterable
+
 import pytest
 from rich.console import Console
 from textual.message_pump import active_app
@@ -15,7 +17,9 @@ from dm_tui.app import (
 )
 from dm_tui.discovery import MotorInfo
 from dm_tui.dmlib import params
+from dm_tui.dmlib import protocol
 from dm_tui.dmlib.protocol import Feedback
+from dm_tui.persistence import MotorRecord
 from textual.widgets import Button
 
 
@@ -34,6 +38,14 @@ class _StubInput:
 class _StubButtonEvent:
     def __init__(self, button_id: str) -> None:
         self.button = type("_Btn", (), {"id": button_id})()
+
+
+class _StubBusManager:
+    def __init__(self) -> None:
+        self.filters: list[dict[str, int]] | None = None
+
+    def set_filters(self, filters: Iterable[dict[str, int]]) -> None:
+        self.filters = list(filters)
 
 
 def test_motor_table_update_rows_handles_missing_records() -> None:
@@ -82,6 +94,50 @@ def test_mit_modal_parses_user_values() -> None:
     assert result.torque_nm == 0.0  # blank falls back to default
     assert result.kp == 50.0
     assert result.kd == 2.5
+
+
+def test_reapply_filters_allows_management_frames(tmp_path) -> None:
+    """Filters should always allow management responses used for RID reads."""
+
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    bus = _StubBusManager()
+    app._bus_manager = bus  # type: ignore[assignment]
+    app._motor_records[0x01] = MotorRecord(esc_id=0x01, mst_id=0x101)
+
+    app._reapply_filters()
+
+    assert bus.filters is not None
+    assert {"can_id": 0x101, "can_mask": 0x7FF, "extended": 0} in bus.filters
+    assert {
+        "can_id": protocol.MANAGEMENT_ARBITRATION_ID,
+        "can_mask": 0x7FF,
+        "extended": 0,
+    } in bus.filters
+
+
+def test_reapply_filters_include_catch_all_during_discovery(tmp_path) -> None:
+    """Discovery mode should leave room for unseen MST IDs."""
+
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    bus = _StubBusManager()
+    app._bus_manager = bus  # type: ignore[assignment]
+    app._motor_records[0x01] = MotorRecord(esc_id=0x01, mst_id=0x101)
+
+    app._discovery_running = True
+    app._reapply_filters()
+    assert bus.filters is not None
+    catch_all = {"can_id": 0, "can_mask": 0, "extended": 0}
+    assert catch_all in bus.filters
+
+    app._discovery_running = False
+    app._reapply_filters()
+    assert bus.filters is not None
+    assert catch_all not in bus.filters
+    assert {
+        "can_id": protocol.MANAGEMENT_ARBITRATION_ID,
+        "can_mask": 0x7FF,
+        "extended": 0,
+    } in bus.filters
 
 
 def test_ingest_feedback_fetches_rid_limits(monkeypatch, tmp_path) -> None:

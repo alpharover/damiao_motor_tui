@@ -1656,6 +1656,7 @@ class DmTuiApp(App[None]):
             if self._discovery_running:
                 return
             self._discovery_running = True
+        self._reapply_filters()
         threading.Thread(target=self._discovery_worker, args=(force_active,), daemon=True).start()
 
     def _schedule_bus_stats_refresh(self) -> None:
@@ -1748,6 +1749,10 @@ class DmTuiApp(App[None]):
         finally:
             with self._threads_lock:
                 self._discovery_running = False
+            try:
+                self.call_from_thread(self._reapply_filters)
+            except Exception:  # pragma: no cover - defensive guard during shutdown
+                pass
 
     def _bus_stats_worker(self) -> None:
         try:
@@ -2094,10 +2099,13 @@ class DmTuiApp(App[None]):
         if not self._bus_manager:
             return
         mst_ids = [record.mst_id for record in self._motor_records.values() if record.mst_id]
-        if not mst_ids:
-            return
+        filters = protocol.build_filters(mst_ids)
+        if self._discovery_running or not mst_ids:
+            catch_all_filter = {"can_id": 0, "can_mask": 0, "extended": 0}
+            if catch_all_filter not in filters:
+                filters.append(catch_all_filter)
         try:
-            self._bus_manager.set_filters(protocol.build_filters(mst_ids))
+            self._bus_manager.set_filters(filters)
         except BusManagerError as exc:  # pragma: no cover
             self._log(f"[yellow]Warning:[/yellow] failed to apply filters: {exc}")
 
