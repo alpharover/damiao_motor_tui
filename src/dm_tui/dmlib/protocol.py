@@ -247,7 +247,36 @@ def decode_feedback(data: bytes) -> Feedback:
 
 def build_filters(mst_ids: Iterable[int]) -> list[dict[str, int]]:
     """Create kernel filter definitions for a collection of MST IDs."""
-    return [{"can_id": mst_id, "can_mask": 0x7FF, "extended": 0} for mst_id in mst_ids]
+
+    filters: list[dict[str, int]] = []
+    seen: set[int] = set()
+    for mst_id in mst_ids:
+        if mst_id in seen:
+            continue
+        filters.append({"can_id": mst_id, "can_mask": 0x7FF, "extended": 0})
+        seen.add(mst_id)
+
+    management_filter = {
+        "can_id": MANAGEMENT_ARBITRATION_ID,
+        "can_mask": 0x7FF,
+        "extended": 0,
+    }
+    if MANAGEMENT_ARBITRATION_ID not in seen:
+        filters.append(management_filter)
+    else:
+        # Ensure the management arbitration ID appears exactly once even if provided explicitly.
+        filters = [
+            filter_entry
+            for filter_entry in filters
+            if not (
+                filter_entry.get("can_id") == MANAGEMENT_ARBITRATION_ID
+                and filter_entry.get("can_mask") == 0x7FF
+                and filter_entry.get("extended") == 0
+            )
+        ]
+        filters.append(management_filter)
+
+    return filters
 
 
 def frame_param_read(esc_id: int, rid: int) -> tuple[int, bytes]:
