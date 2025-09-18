@@ -19,7 +19,7 @@ from dm_tui.discovery import MotorInfo
 from dm_tui.dmlib import params
 from dm_tui.dmlib import protocol
 from dm_tui.dmlib.protocol import Feedback
-from dm_tui.persistence import MotorRecord
+from dm_tui.persistence import BusConfig, MotorRecord
 from textual.widgets import Button
 
 
@@ -46,6 +46,39 @@ class _StubBusManager:
 
     def set_filters(self, filters: Iterable[dict[str, int]]) -> None:
         self.filters = list(filters)
+
+
+def test_open_bus_uses_configured_bitrate(monkeypatch, tmp_path) -> None:
+    app = DmTuiApp(config_path=tmp_path / "config.yaml")
+    app._config.buses = [BusConfig(channel="vcan0", bitrate=250_000)]
+
+    captured: dict[str, object] = {}
+
+    class _StubBusManager:
+        def __init__(self, *, channel: str, **kwargs) -> None:
+            captured["channel"] = channel
+            captured["kwargs"] = kwargs
+
+        def open(self) -> None:
+            captured["opened"] = True
+
+        def register_listener(self, callback) -> None:
+            captured["listener"] = callback
+
+        def close(self) -> None:  # pragma: no cover - defensive stub
+            captured["closed"] = True
+
+    monkeypatch.setattr("dm_tui.app.BusManager", _StubBusManager)
+    app._update_bus_stats = lambda stats: None
+    app._refresh_control_panel = lambda: None
+    app._reapply_filters = lambda: None
+    app._log = lambda message: None
+
+    app._open_bus("vcan0")
+
+    assert captured["channel"] == "vcan0"
+    assert captured["kwargs"].get("bitrate") == 250_000
+    assert captured.get("opened") is True
 
 
 def test_motor_table_update_rows_handles_missing_records() -> None:
